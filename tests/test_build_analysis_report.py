@@ -37,10 +37,22 @@ _RES = [
 ]
 
 
+# Interface catalog (from list_interfaces_tool) — supplies the business-friendly
+# description joined on namespace+name+version.
+_CATALOG = [
+    {"namespace": "NS1", "interfaceName": "FINEXTBANK", "interfaceVersion": "1",
+     "about": "External bank statement import"},
+    {"namespace": "NS1", "interfaceName": "ORDERS", "interfaceVersion": "1",
+     "about": "Sales order replication"},
+    {"namespace": "NS1", "interfaceName": "PAYMENTS", "interfaceVersion": "2",
+     "about": "Outgoing payment posting"},
+]
+
+
 def _report(**over):
     kw = dict(period="2023 to today", date_from="2023-01-01T00:00:00Z",
               date_to="2026-06-16T23:59:59Z", statistics=_STATS,
-              error_rows=_ERR_ROWS, resolutions=_RES)
+              error_rows=_ERR_ROWS, resolutions=_RES, interfaces_catalog=_CATALOG)
     kw.update(over)
     return _build_analysis_report(**kw)["report"]
 
@@ -50,17 +62,44 @@ def test_returns_markdown_with_all_sections():
     assert "AIF Interface Monitoring Report" in r
     assert "Health Scorecard" in r
     assert "Active Interfaces" in r
-    assert "Prioritized Action Plan" in r
+    assert "Top" in r and "Common Errors" in r          # top-errors list (replaces action plan)
     assert "Error Resolutions" in r
     assert "2023 to today" in r  # period echoed
+
+
+def test_period_header_has_no_central_finance_label():
+    # (a) the hardcoded "Central Finance" label must be gone.
+    r = _report()
+    header = r.splitlines()[1]
+    assert "Central Finance" not in header
+    assert "2023 to today" in header
+
+
+def test_no_prioritized_action_plan_section():
+    # (d) the action plan is removed entirely.
+    assert "Prioritized Action Plan" not in _report()
+    assert "Restart-safe" not in _report().split("Error Resolutions")[0]  # not in the list either
+
+
+def test_active_interfaces_shows_description_not_namespace_version():
+    # (c) business-friendly: description column, no Version column.
+    r = _report()
+    # description from the catalog join
+    assert "External bank statement import" in r
+    assert "Sales order replication" in r
+    # the Version column header is gone; a Description column is present
+    table_header = next(l for l in r.splitlines() if l.startswith("| Interface"))
+    assert "Version" not in table_header
+    assert "Description" in table_header
+    assert "Total" in table_header
+    # all-type totals still present
+    assert "Warnings" in table_header and "Success" in table_header
 
 
 def test_active_interfaces_excludes_zero_traffic():
     r = _report()
     assert "FINEXTBANK" in r and "ORDERS" in r and "PAYMENTS" in r
     assert "IDLE" not in r  # total == 0 -> not active
-    # table header present (not just rows), with the Error % column
-    assert "| Interface | Version | Total | Errors | Error % | Warnings | Success | Health |" in r
 
 
 def test_no_ascii_charts_for_joule():
@@ -97,12 +136,6 @@ def test_non_ascii_grounding_text_is_normalised():
     assert "FINEXTBANK" in r
 
 
-def test_error_share_percent_column():
-    # FINEXTBANK: 41 errors / 63 total errors ≈ 65.1%
-    r = _report()
-    assert "65.1%" in r
-
-
 def test_scorecard_breaks_down_all_message_types():
     """Scorecard must report success/warning/error counts AND percentages,
     computed across all message types (not just errors)."""
@@ -136,19 +169,42 @@ def test_grade_reflects_error_percentage():
     assert "grade: D" in r
 
 
-def test_priority_plan_orders_by_score():
-    # FI/042: 42 * (1+2) * 1.0 = 126 ; SD/007: 5 * (1+1) * 1.5 = 15 -> FI first.
+def test_top_errors_list_ordered_by_occurrences():
+    # (e) most-common-errors list ordered by occurrence count: FI/042 (42) before SD/007 (5).
     r = _report()
-    fi = r.index("FI/042")
-    sd = r.index("SD/007")
-    assert fi < sd
+    top_section = r.split("Common Errors")[1].split("Error Resolutions")[0]
+    assert top_section.index("FI/042") < top_section.index("SD/007")
+    # criticality column present
+    assert "Criticality" in top_section or "Critical" in top_section
 
 
-def test_resolution_text_is_verbatim():
-    r = _report()
-    assert "The fiscal period is not open." in r
-    assert "Open period in OB52" in r
-    assert "[AIF Guide](https://x/doc)" in r
+def test_biggest_risk_no_empty_msgid_slash():
+    # (b) empty msgId/msgNo must not render as "-/-"; defensive fallback.
+    res = [dict(_RES[0], msgId="", msgNo="", occurrences=9)]
+    r = _build_analysis_report(period="2024", date_from="2024-01-01T00:00:00Z",
+                               date_to="2024-12-31T23:59:59Z", statistics=_STATS,
+                               error_rows=[], resolutions=res, grounded_total=1,
+                               interfaces_catalog=_CATALOG)["report"]
+    assert "-/-" not in r
+
+
+def test_resolution_text_is_verbatim_and_capped_to_3_bullets():
+    # (f) resolutions show at most 3 short bullets.
+    long_steps = dict(_RES[0], resolutionSteps=[f"step {i}" for i in range(1, 8)])
+    r = _report(resolutions=[long_steps, _RES[1]], grounded_total=2)
+    assert "The fiscal period is not open." in r        # root cause still verbatim
+    res_section = r.split("Error Resolutions")[1]
+    # only 3 numbered bullets for the first resolution
+    assert "1. step 1" in res_section
+    assert "3. step 3" in res_section
+    assert "4. step 4" not in res_section
+
+
+def test_resolutions_capped_at_20():
+    many = [dict(_RES[0], msgNo=f"{i:03d}", occurrences=100 - i) for i in range(25)]
+    r = _report(resolutions=many, grounded_total=25)
+    res_section = r.split("Error Resolutions")[1]
+    assert res_section.count("### ") <= 20
 
 
 def test_truncation_note_when_more_distinct_errors():
@@ -161,4 +217,4 @@ def test_zero_error_path():
     r = _report(statistics=healthy, error_rows=[], resolutions=[], grounded_total=0)
     assert "Healthy" in r
     assert "Error Resolutions" not in r
-    assert "Prioritized Action Plan" not in r
+    assert "Common Errors" not in r

@@ -318,19 +318,20 @@ Your tools:
 
 Rules for AIF analysis (rules 1-10) — the full monitoring report (intent=analysis):
 1. First call calculate_date_range_tool(period) to resolve the user's period to
-   from/to. Then call get_interface_statistics_tool(date_from, date_to) for the
-   per-interface counts AND list_error_messages_tool(date_from, date_to, status='E')
-   for the error rows. (Do NOT use run_analysis_tool — it is deprecated for this
-   service.) These two results drive the report.
-2. If both tools fail or return empty, return exactly: "No AIF interface data available for [period]." — nothing else.
+   from/to. Then call, in any order: get_interface_statistics_tool(date_from, date_to)
+   for the per-interface counts (ALL message types: success/warning/error/in-process),
+   list_error_messages_tool(date_from, date_to, status='E') for the error rows, AND
+   list_interfaces_tool() for the interface descriptions (used to label the traffic
+   table for business users). (Do NOT use run_analysis_tool — it is deprecated.)
+2. If the statistics and error tools both fail or return empty, return exactly: "No AIF interface data available for [period]." — nothing else.
 3. If there are no errors at all, skip steps 4-8 (do NOT call run_doc_error_catalog_tool); go straight to step 9 with resolutions=[] and grounded_total=0.
-4. If errors exist, group the error rows by distinct error (MSGID/MSGNO, or by log-message text when MSGID/MSGNO are absent) and rank by occurrence count. Take the TOP 5 distinct errors (break ties lexicographically). Let grounded_total = the number of distinct errors that exist (may be >5).
-5. For EACH of those top-5 distinct errors, build the grounding query as: MSGID + "/" + MSGNO + " " + MSGTX (omit trailing space if MSGTX is absent).
-6. Call run_doc_error_catalog_tool ONCE per distinct error (so up to 5 calls total — never more). Do not ground errors outside the top 5.
-7. For each error build a resolution entry: { msgId, msgNo, messageText, affectedInterfaces:[…], occurrences:N, restartSafe:true|false, rootCause, resolutionSteps:[…], sourceText }. If grounding returns no match/fails for an error, set rootCause = "No resolution guidance available in the document catalog for this error.", resolutionSteps = [], and sourceText = "SAP standard documentation for <MSGID>/<MSGNO>".
+4. If errors exist, group the error rows by distinct error (MSGID/MSGNO, or by log-message text when MSGID/MSGNO are absent) and rank by occurrence count (most common first). Take the TOP 20 distinct errors (break ties lexicographically). Let grounded_total = the number of distinct errors that exist (may be >20).
+5. For EACH of those top-20 distinct errors, build the grounding query as: MSGID + "/" + MSGNO + " " + MSGTX (omit trailing space if MSGTX is absent).
+6. Call run_doc_error_catalog_tool ONCE per distinct error (so up to 20 calls total — never more). Do not ground errors outside the top 20.
+7. For each error build a resolution entry: { msgId, msgNo, messageText, affectedInterfaces:[...], occurrences:N, restartSafe:true|false, rootCause, resolutionSteps:[...], sourceText }. ALWAYS set msgId and msgNo to the real values (never blank). If grounding returns no match/fails, set rootCause = "No resolution guidance available in the document catalog for this error.", resolutionSteps = [], sourceText = "SAP standard documentation for <MSGID>/<MSGNO>". The builder shows at most the first 3 resolutionSteps, so order the most important steps first.
 8. rootCause and resolutionSteps MUST come VERBATIM from the grounding response `groundingText`/grounded fields. Never synthesize them from your own knowledge.
-9. Call build_analysis_report_tool(period, date_from, date_to, statistics=<interfaces[] from get_interface_statistics_tool>, error_rows=<messages[] from list_error_messages_tool>, resolutions=<the entries from step 7, or []>, grounded_total=<count from step 4, or 0>). Return its `report` value VERBATIM as your answer — do NOT rewrite, re-summarise, or recompute any of its tables, bars, grade, or trend.
-10. Criticality (used by the builder): 6+ errors = Critical, 1-5 = Warning, 0 = Healthy. Do NOT append any action menu or follow-up prompt after the report.
+9. Call build_analysis_report_tool(period, date_from, date_to, statistics=<interfaces[] from get_interface_statistics_tool>, error_rows=<messages[] from list_error_messages_tool>, resolutions=<the entries from step 7, or []>, grounded_total=<count from step 4, or 0>, interfaces_catalog=<interfaces[] from list_interfaces_tool>). Return its `report` value VERBATIM as your answer — do NOT rewrite, re-summarise, or recompute any of its tables, counts, or grade.
+10. Criticality (used by the builder): 6+ occurrences = Critical, 1-5 = Warning, 0 = Healthy. Do NOT append any action menu or follow-up prompt after the report.
 
 Rules for interface detail lookup (rule 19):
 19. When the user asks about an interface by providing a namespace (NS), interface name (IFNAME), and/or version (IFVERSION) — or asks what an interface does, what it is for, or for insights about it — call get_interface_details_tool with those values.
@@ -451,15 +452,15 @@ when several genuinely match. Never invent a GUID or interface.
     analysis — use rule 23 instead.
 
 The full report Markdown is assembled deterministically by build_analysis_report_tool
-(rule 9): a health scorecard with a letter grade, a success rate, and a breakdown of
-ALL message types (success / warning / error / other, with counts and percentages
-computed from the statistics — not just errors); an Active Interfaces table
-(interfaces with traffic in the period, including each interface's error share %);
-a prioritized action plan; a risk callout; and per-MSGID/MSGNO error resolutions
-(resolutions remain ERROR-only). The report is plain ASCII Markdown tables/text only —
-no charts, no emoji/icons — so SAP Joule renders it cleanly. You never hand-build these
-sections — you only feed the tool the statistics, error rows, and grounded resolutions,
-then return its output unchanged.
+(rule 9): a risk callout; a health scorecard with a letter grade, a success rate, and a
+breakdown of ALL message types (success / warning / error / in-process, with counts and
+percentages from the statistics); an Active Interfaces table showing each interface's
+business DESCRIPTION (not namespace/version) with all-type totals; a "Top 20 Most Common
+Errors" list (ranked by occurrences, with criticality); and an "Error Resolutions" section
+(top 20, each a short root cause + max 3 steps, ERROR-only, grounded verbatim). The report
+is plain ASCII Markdown tables/text only — no charts, no emoji/icons — so SAP Joule renders
+it cleanly. You never hand-build these sections — you only feed the tool the statistics,
+error rows, grounded resolutions, and interface catalog, then return its output unchanged.
 """
 
 
@@ -873,6 +874,10 @@ def _ascii(text: str) -> str:
     return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
 
 
+_TOP_N = 20          # top errors listed / resolved in the report
+_MAX_BULLETS = 3     # max resolution bullets per error (short, for readability)
+
+
 def _build_analysis_report(
     period: str,
     date_from: str,
@@ -881,30 +886,52 @@ def _build_analysis_report(
     error_rows: list[dict],
     resolutions: list[dict],
     grounded_total: int | None = None,
+    interfaces_catalog: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Assemble the full AIF monitoring report as Markdown. Pure function.
 
-    All metrics (grade, per-interface error share %, priority order) are computed
-    here so they are exact and consistent. Output is plain Markdown tables/text
-    only — no ASCII charts — so SAP Joule renders it cleanly. Grounding text from
-    `resolutions` is placed VERBATIM — never edited or invented.
+    All metrics are computed here so they are exact and consistent. Output is
+    plain ASCII Markdown tables/text only — no charts, no emoji — so SAP Joule
+    renders it cleanly. Grounding text from `resolutions` is placed VERBATIM.
 
     Args:
         period:        the user's free-text period (echoed in the header).
         date_from/to:  resolved V4 bounds (echoed in the header).
         statistics:    interfaces[] from get_interface_statistics_tool — drives
-                       all counts and the per-interface error share %.
+                       all counts (all message types) and per-interface health.
         error_rows:    messages[] from list_error_messages_tool. Accepted for the
-                       analysis contract; currently not rendered directly.
-        resolutions:   grounded error entries (top distinct), each:
+                       analysis contract; not rendered directly.
+        resolutions:   grounded error entries (top distinct, up to 20), each:
                        {msgId, msgNo, messageText, affectedInterfaces[],
                         occurrences, restartSafe, rootCause, resolutionSteps[],
                         sourceText}.
         grounded_total: distinct error count that existed (for the truncation
                         note). Defaults to len(resolutions).
+        interfaces_catalog: interfaces[] from list_interfaces_tool — supplies the
+                       business-friendly description (about/searchBy) joined on
+                       namespace+name+version for the Active Interfaces table.
     """
     stats = statistics or []
     res = resolutions or []
+    catalog = interfaces_catalog or []
+
+    # description lookup keyed on (namespace, name, version)
+    desc_by_key: dict[tuple, str] = {}
+    for c in catalog:
+        key = (c.get("namespace", ""), c.get("interfaceName", ""), c.get("interfaceVersion", ""))
+        desc_by_key[key] = c.get("about") or c.get("searchBy") or ""
+
+    def _iface_desc(s: dict) -> str:
+        key = (s.get("namespace", ""), s.get("interfaceName", ""), s.get("interfaceVersion", ""))
+        return desc_by_key.get(key) or s.get("interfaceName", "") or "-"
+
+    def _id(r: dict) -> str:
+        """msgId/msgNo, defensively avoiding the bare '-/-' for empty values."""
+        mid = (r.get("msgId") or "").strip()
+        mno = (r.get("msgNo") or "").strip()
+        if mid and mno:
+            return f"{mid}/{mno}"
+        return mid or mno or "-"
     total = sum(int(s.get("total", 0) or 0) for s in stats)
     total_errors = sum(int(s.get("errors", 0) or 0) for s in stats)
     total_warnings = sum(int(s.get("warnings", 0) or 0) for s in stats)
@@ -932,38 +959,40 @@ def _build_analysis_report(
     active = [s for s in stats if int(s.get("total", 0) or 0) > 0]
     has_errors = total_errors > 0 and bool(res)
 
-    # --- prioritized action plan ---------------------------------------------
-    def score(r) -> float:
-        occ = int(r.get("occurrences", 0) or 0)
-        ifaces = len(r.get("affectedInterfaces", []) or [])
-        weight = 1.0 if r.get("restartSafe") else 1.5
-        return occ * (1 + ifaces) * weight
+    DASH = "-"
 
-    ranked = sorted(res, key=score, reverse=True)
+    def criticality(occ: int) -> str:
+        # Same thresholds as interface health: 6+ Critical, 1-5 Warning.
+        return "Critical" if occ >= 6 else ("Warning" if occ >= 1 else "Low")
+
+    # Most-common errors first (by occurrence count), then by criticality, capped
+    # to the top N. This single ranking drives both the list and the resolutions.
+    ranked = sorted(
+        res,
+        key=lambda r: (int(r.get("occurrences", 0) or 0),
+                       criticality(int(r.get("occurrences", 0) or 0)) == "Critical"),
+        reverse=True,
+    )[:_TOP_N]
 
     # --- assemble Markdown ----------------------------------------------------
     # PURE ASCII ONLY. SAP Joule's renderer errors on non-ASCII (em dash, middle
-    # dot, arrows, emoji), so use '-' as the empty-field placeholder, ASCII
-    # separators, and word labels. Verbatim grounding/interface text is
-    # ASCII-normalised by _ascii() at the end.
-    DASH = "-"
+    # dot, arrows, emoji), so use '-' placeholders, ASCII separators, word labels.
     out: list[str] = []
     out.append("# AIF Interface Monitoring Report")
-    out.append(f"**Period:** {period} | {date_from[:10]} to {date_to[:10]} | Central Finance\n")
+    out.append(f"**Period:** {period} | {date_from[:10]} to {date_to[:10]}\n")
 
     if has_errors and ranked:
         top = ranked[0]
         out.append(
-            f"> **Biggest risk:** {top.get('msgId', DASH)}/{top.get('msgNo', DASH)} "
-            f"\"{top.get('messageText', DASH)}\" - {top.get('occurrences', 0)} occurrences "
+            f"> **Biggest risk:** {_id(top)} "
+            f"\"{top.get('messageText') or DASH}\" - {top.get('occurrences', 0)} occurrences "
             f"across {len(top.get('affectedInterfaces', []) or [])} interface(s).\n"
             f"> **Do this first:** "
             f"{(top.get('resolutionSteps') or ['Review the resolution below.'])[0]}\n"
         )
 
-    # Scorecard (plain text — no ASCII charts; Joule renders the markdown).
-    # Calculation covers ALL message types (success / warning / error / other),
-    # not just errors, from the per-interface statistics.
+    # Scorecard — calculation covers ALL message types (success / warning /
+    # error / other), not just errors, from the per-interface statistics.
     out.append("## Health Scorecard")
     out.append(
         f"**Overall grade: {grade(err_pct)}** | "
@@ -977,60 +1006,54 @@ def _build_analysis_report(
         out.append(f"- {total_other} other/in-progress ({pct(total_other):.1f}%)")
     out.append("")
 
-    # Active interfaces. "Error %" = this interface's share of all errors, which
-    # replaces the former ASCII error-share bar chart.
+    # Active interfaces — business-friendly: show the interface DESCRIPTION (not
+    # namespace/version) and totals across ALL message types.
     out.append("## Active Interfaces (traffic in period)")
-    out.append("| Interface | Version | Total | Errors | Error % | Warnings | Success | Health |")
-    out.append("|-----------|---------|-------|--------|---------|----------|---------|--------|")
+    out.append("| Interface | Description | Total | Errors | Warnings | Success | Health |")
+    out.append("|-----------|-------------|-------|--------|----------|---------|--------|")
     for s in sorted(active, key=lambda s: int(s.get("errors", 0) or 0), reverse=True):
         e = int(s.get("errors", 0) or 0)
-        share = (100.0 * e / total_errors) if total_errors else 0.0
+        tot = int(s.get("total", 0) or 0)
         out.append(
-            f"| {s.get('interfaceName', DASH)} | {s.get('interfaceVersion', DASH)} | "
-            f"{s.get('total', 0)} | {e} | {share:.1f}% | {s.get('warnings', 0)} | "
+            f"| {s.get('interfaceName', DASH)} | {_iface_desc(s)} | "
+            f"{tot} | {e} | {s.get('warnings', 0)} | "
             f"{s.get('success', 0)} | {s.get('health', DASH)} |"
         )
     if not active:
-        out.append("| - | - | 0 | 0 | 0.0% | 0 | 0 | Healthy |")
+        out.append("| - | - | 0 | 0 | 0 | 0 | Healthy |")
     out.append("")
 
-    # Prioritized action plan
     if has_errors and ranked:
-        out.append("## Prioritized Action Plan")
-        out.append("| # | Error | Affected interfaces | Occurrences | Restart-safe | Priority |")
-        out.append("|---|-------|---------------------|-------------|--------------|----------|")
-        n = len(ranked)
+        # Top N most common errors, highest occurrence first, with criticality.
+        out.append(f"## Top {len(ranked)} Most Common Errors")
+        out.append("| # | Error | Message | Occurrences | Criticality | Affected interfaces |")
+        out.append("|---|-------|---------|-------------|-------------|---------------------|")
         for i, r in enumerate(ranked, 1):
-            band = "High" if i <= max(1, n // 3) else ("Medium" if i <= max(2, 2 * n // 3) else "Low")
+            occ = int(r.get("occurrences", 0) or 0)
             ifaces = ", ".join(r.get("affectedInterfaces", []) or []) or DASH
             out.append(
-                f"| {i} | {r.get('msgId', DASH)}/{r.get('msgNo', DASH)} | {ifaces} | "
-                f"{r.get('occurrences', 0)} | {'yes' if r.get('restartSafe') else 'no'} | {band} |"
+                f"| {i} | {_id(r)} | {r.get('messageText') or DASH} | "
+                f"{occ} | {criticality(occ)} | {ifaces} |"
             )
         out.append("")
 
-        # Error resolutions (per distinct MSGID/MSGNO) — verbatim grounding
-        out.append("## Error Resolutions")
+        # Top N resolutions — SHORT: root cause + max 3 bullets, verbatim grounding.
+        out.append(f"## Error Resolutions (top {len(ranked)})")
         for r in ranked:
-            out.append(f"### {r.get('msgId', DASH)}/{r.get('msgNo', DASH)} - \"{r.get('messageText', DASH)}\"")
+            out.append(f"### {_id(r)} - \"{r.get('messageText') or DASH}\"")
             out.append(
-                f"**Affected:** {', '.join(r.get('affectedInterfaces', []) or []) or DASH} | "
-                f"**Occurrences:** {r.get('occurrences', 0)} | "
-                f"**Restart-safe:** {'yes' if r.get('restartSafe') else 'no'}\n"
+                f"**Root Cause:** {r.get('rootCause') or 'No resolution guidance available in the document catalog for this error.'}"
             )
-            out.append(f"**Root Cause:** {r.get('rootCause') or 'No resolution guidance available in the document catalog for this error.'}")
-            steps = r.get("resolutionSteps") or []
-            if steps:
-                out.append("**Resolution Steps:**")
-                for j, step in enumerate(steps, 1):
-                    out.append(f"{j}. {step}")
+            steps = (r.get("resolutionSteps") or [])[:_MAX_BULLETS]
+            for j, step in enumerate(steps, 1):
+                out.append(f"{j}. {step}")
             if r.get("sourceText"):
                 out.append(f"**Source:** {r['sourceText']}")
             out.append("")
 
         gt = grounded_total if grounded_total is not None else len(res)
-        if gt > len(res):
-            out.append(f"_+{gt - len(res)} more distinct error(s) not grounded (showing top {len(res)} by frequency)._")
+        if gt > len(ranked):
+            out.append(f"_+{gt - len(ranked)} more distinct error(s) not shown (top {len(ranked)} by frequency)._")
     else:
         out.append("> **Healthy** - no errors in this period. Nothing to resolve.")
 
@@ -1046,35 +1069,41 @@ def build_analysis_report_tool(
     error_rows: list[dict],
     resolutions: list[dict],
     grounded_total: int = -1,
+    interfaces_catalog: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Assemble the FULL AIF monitoring report (Markdown) for the analysis intent.
 
     Call this LAST in the analysis flow, after gathering statistics + error rows
     and grounding the top distinct errors. Return the `report` value VERBATIM as
-    the answer. All visuals (scorecard, error-share bars, trend, priority plan)
-    are computed here — do not recompute or alter them.
+    the answer. All metrics are computed here — do not recompute or alter them.
 
     Args:
         period: the user's period text, e.g. '2023 to today'.
         date_from: resolved V4 start, e.g. '2023-01-01T00:00:00Z'.
         date_to: resolved V4 end, e.g. '2026-06-16T23:59:59Z'.
-        statistics: the interfaces[] list from get_interface_statistics_tool.
+        statistics: the interfaces[] list from get_interface_statistics_tool
+            (drives all-message-type counts and per-interface health).
         error_rows: the messages[] list from list_error_messages_tool (status='E').
-        resolutions: one entry per distinct top error (max 5), each with keys
-            msgId, msgNo, messageText, affectedInterfaces (list), occurrences (int),
-            restartSafe (bool), rootCause (verbatim from grounding), resolutionSteps
-            (list, verbatim), sourceText. Use '—'/[] when a field is unknown and
-            'No resolution guidance available…' for rootCause if grounding missed.
+        resolutions: one entry per distinct top error (up to 20, ranked by
+            occurrence), each with keys msgId, msgNo, messageText,
+            affectedInterfaces (list), occurrences (int), restartSafe (bool),
+            rootCause (verbatim from grounding), resolutionSteps (list, verbatim;
+            only the first 3 are shown), sourceText. Use '-'/[] when unknown and
+            'No resolution guidance available...' for rootCause if grounding missed.
         grounded_total: total number of DISTINCT errors that existed in the period
             (so the report can note how many were truncated). Pass -1 to default to
             len(resolutions).
+        interfaces_catalog: the interfaces[] list from list_interfaces_tool, used to
+            show a business-friendly description per interface (joined on
+            namespace+name+version). Pass [] if not fetched.
     """
     with tracer.start_as_current_span("build_analysis_report_tool") as span:
         gt = None if grounded_total is None or grounded_total < 0 else grounded_total
         span.set_attribute("aif.interface_count", len(statistics or []))
         span.set_attribute("aif.resolution_count", len(resolutions or []))
         return _build_analysis_report(
-            period, date_from, date_to, statistics, error_rows, resolutions, gt
+            period, date_from, date_to, statistics, error_rows, resolutions, gt,
+            interfaces_catalog=interfaces_catalog or [],
         )
 
 
