@@ -88,10 +88,13 @@ class InterfaceStat(BaseModel):
     namespace: str
     interfaceName: str
     interfaceVersion: str
-    total: int = Field(description="NumberAllMessages.")
+    total: int = Field(description="NumberAllMessages (every status).")
     errors: int = Field(description="NumberErrorMessages.")
     warnings: int = Field(description="NumberWarningMessages.")
     success: int = Field(description="NumberSuccessMessages.")
+    inProcess: int = Field(default=0, description="NumberInProcessMessages.")
+    aborted: int = Field(default=0, description="NumberAbortMessages.")
+    canceled: int = Field(default=0, description="NumberCanceledMessages.")
     health: str = Field(description="Critical (6+ errors) / Warning (1-5) / Healthy (0).")
 
 
@@ -240,7 +243,7 @@ class CardData(BaseModel):
     # interface_list / business_key(interfaces) / statistics
     interfaces: list[dict] = Field(
         default_factory=list,
-        description="interface_list: {namespace, interfaceName, interfaceVersion, sapModule, about, searchBy}. statistics: {namespace, interfaceName, interfaceVersion, total, errors, warnings, success, health}.",
+        description="interface_list: {namespace, interfaceName, interfaceVersion, sapModule, about, searchBy}. statistics: {namespace, interfaceName, interfaceVersion, total, errors, warnings, success, inProcess, aborted, canceled, health}.",
     )
     # worklist / business_key(messages)
     messages: list[dict] = Field(

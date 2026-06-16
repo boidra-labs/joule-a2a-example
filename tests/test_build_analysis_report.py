@@ -163,19 +163,47 @@ def test_status_percentages_sum_consistently():
     assert "10 error (10.0%)" in r
 
 
+def test_scorecard_shows_inprocess_aborted_canceled():
+    # Real payload shape: 132 = 70 success + 58 error + 2 warn + 1 inProcess
+    #                         + 0 abort + 1 canceled
+    stats = [{"namespace": "N", "interfaceName": "X", "interfaceVersion": "1",
+              "total": 132, "errors": 58, "warnings": 2, "success": 70,
+              "inProcess": 1, "aborted": 0, "canceled": 1, "health": "Critical"}]
+    res = [dict(_RES[0], occurrences=58, affectedInterfaces=["X"])]
+    r = _build_analysis_report(period="2024", date_from="2024-01-01T00:00:00Z",
+                               date_to="2024-12-31T23:59:59Z", statistics=stats,
+                               error_rows=[], resolutions=res, grounded_total=1)["report"]
+    assert "132 messages" in r
+    # every non-zero status is itemised in the breakdown
+    assert "1 in-process" in r.lower()
+    assert "1 canceled" in r.lower()
+    # zero-count statuses (aborted) are omitted to keep it readable
+    assert "0 aborted" not in r.lower()
+    # traffic table shows in-process per interface
+    table_header = next(l for l in r.splitlines() if l.startswith("| Interface"))
+    assert "In-Process" in table_header
+
+
 def test_grade_reflects_error_percentage():
     # 63 errors / 620 total ≈ 10.2% -> grade D (<15%)
     r = _report()
     assert "grade: D" in r
 
 
-def test_top_errors_list_ordered_by_occurrences():
-    # (e) most-common-errors list ordered by occurrence count: FI/042 (42) before SD/007 (5).
+def test_top_errors_list_ordered_with_cumulative():
+    # (e) most-common-errors list ordered by occurrences, with a running cumulative.
     r = _report()
     top_section = r.split("Common Errors")[1].split("Error Resolutions")[0]
-    assert top_section.index("FI/042") < top_section.index("SD/007")
-    # criticality column present
-    assert "Criticality" in top_section or "Critical" in top_section
+    # ordered: "Posting period closed" (42) before "Customer not found" (5)
+    assert top_section.index("Posting period closed") < top_section.index("Customer not found")
+    header = next(l for l in top_section.splitlines() if l.startswith("| #"))
+    # only Message, Occurrences, Cumulative — dropped Error/Criticality/Affected
+    assert "Message" in header and "Occurrences" in header and "Cumulative" in header
+    assert "Error" not in header and "Criticality" not in header and "Affected" not in header
+    # cumulative accumulates: 42 then 42+5=47
+    rows = [l for l in top_section.splitlines() if l.startswith("| 1 ") or l.startswith("| 2 ")]
+    assert rows[0].rstrip().endswith("42 |")     # cumulative after row 1
+    assert rows[1].rstrip().endswith("47 |")     # cumulative after row 2
 
 
 def test_biggest_risk_no_empty_msgid_slash():

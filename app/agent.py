@@ -497,7 +497,7 @@ You are given: the user's request, the tools that were called and their JSON res
 Pick `intent` from what the user asked for and which tools ran:
 - interface_list — "which/list interfaces available". data = { count, interfaces:[{namespace, interfaceName, interfaceVersion, sapModule, about, searchBy}] }.
 - worklist — "list/show errors for a period/interface". data = { count, messages:[{messageGuid, namespace, interfaceName, interfaceVersion, status, processDate, logMessage}] }.
-- statistics / health — "health check", "statistics", "error counts per interface". data = { interfaceCount, interfaces:[{namespace, interfaceName, interfaceVersion, total, errors, warnings, success, health}] }. health = Critical (6+ errors) / Warning (1-5) / Healthy (0).
+- statistics / health — "health check", "statistics", "error counts per interface". data = { interfaceCount, interfaces:[{namespace, interfaceName, interfaceVersion, total, errors, warnings, success, inProcess, aborted, canceled, health}] }. total = all message types. health = Critical (6+ errors) / Warning (1-5) / Healthy (0).
 - message_detail — a GUID read. data = { messageGuid, interface, logCount, logEntries:[{msgType, msgId, msgNo, text}] }.
 - business_key — a business object (customer, vendor, cost center, PO…). data = { mode:'interfaces'|'messages', count, interfaces:[...] or messages:[...] }.
 - resolution — "fix/resolve message <GUID>". data = { messageGuid, interface, errorCount, summary, errors:[{msgId, msgNo, messageText, rootCause, resolutionSteps[], restartSafe, grounded, sourceText}] }. sourceText is ALWAYS set: '[title](webUrl)' when a doc matched, else 'SAP standard documentation for <msgId>/<msgNo>'.
@@ -1055,12 +1055,19 @@ def _build_analysis_report(
         if mid and mno:
             return f"{mid}/{mno}"
         return mid or mno or "-"
-    total = sum(int(s.get("total", 0) or 0) for s in stats)
-    total_errors = sum(int(s.get("errors", 0) or 0) for s in stats)
-    total_warnings = sum(int(s.get("warnings", 0) or 0) for s in stats)
-    total_success = sum(int(s.get("success", 0) or 0) for s in stats)
-    # Anything not classified S/W/E (e.g. in-progress P / other X). Never negative.
-    total_other = max(0, total - total_errors - total_warnings - total_success)
+    def _sum(field: str) -> int:
+        return sum(int(s.get(field, 0) or 0) for s in stats)
+
+    total = _sum("total")
+    total_errors = _sum("errors")
+    total_warnings = _sum("warnings")
+    total_success = _sum("success")
+    total_inprocess = _sum("inProcess")
+    total_aborted = _sum("aborted")
+    total_canceled = _sum("canceled")
+    # Any status the endpoint didn't break out (keeps the breakdown summing to total).
+    total_other = max(0, total - total_errors - total_warnings - total_success
+                      - total_inprocess - total_aborted - total_canceled)
 
     def pct(n: int) -> float:
         return (100.0 * n / total) if total else 0.0
@@ -1122,42 +1129,47 @@ def _build_analysis_report(
         f"**Success rate: {success_rate:.1f}%** | {total} messages\n"
     )
     out.append("**Message breakdown (all types):**")
-    out.append(f"- {total_success} success ({pct(total_success):.1f}%)")
-    out.append(f"- {total_warnings} warning ({pct(total_warnings):.1f}%)")
-    out.append(f"- {total_errors} error ({pct(total_errors):.1f}%)")
-    if total_other:
-        out.append(f"- {total_other} other/in-progress ({pct(total_other):.1f}%)")
+    # Itemise every status; skip the ones that are zero to keep it readable.
+    for label, count in (
+        ("success", total_success),
+        ("warning", total_warnings),
+        ("error", total_errors),
+        ("in-process", total_inprocess),
+        ("aborted", total_aborted),
+        ("canceled", total_canceled),
+        ("other", total_other),
+    ):
+        if count:
+            out.append(f"- {count} {label} ({pct(count):.1f}%)")
     out.append("")
 
     # Active interfaces — business-friendly: show the interface DESCRIPTION (not
     # namespace/version) and totals across ALL message types.
     out.append("## Active Interfaces (traffic in period)")
-    out.append("| Interface | Description | Total | Errors | Warnings | Success | Health |")
-    out.append("|-----------|-------------|-------|--------|----------|---------|--------|")
+    out.append("| Interface | Description | Total | Errors | Warnings | Success | In-Process | Health |")
+    out.append("|-----------|-------------|-------|--------|----------|---------|------------|--------|")
     for s in sorted(active, key=lambda s: int(s.get("errors", 0) or 0), reverse=True):
         e = int(s.get("errors", 0) or 0)
         tot = int(s.get("total", 0) or 0)
         out.append(
             f"| {s.get('interfaceName', DASH)} | {_iface_desc(s)} | "
-            f"{tot} | {e} | {s.get('warnings', 0)} | "
-            f"{s.get('success', 0)} | {s.get('health', DASH)} |"
+            f"{tot} | {e} | {s.get('warnings', 0)} | {s.get('success', 0)} | "
+            f"{s.get('inProcess', 0)} | {s.get('health', DASH)} |"
         )
     if not active:
-        out.append("| - | - | 0 | 0 | 0 | 0 | Healthy |")
+        out.append("| - | - | 0 | 0 | 0 | 0 | 0 | Healthy |")
     out.append("")
 
     if has_errors and ranked:
         # Top N most common errors, highest occurrence first, with criticality.
         out.append(f"## Top {len(ranked)} Most Common Errors")
-        out.append("| # | Error | Message | Occurrences | Criticality | Affected interfaces |")
-        out.append("|---|-------|---------|-------------|-------------|---------------------|")
+        out.append("| # | Message | Occurrences | Cumulative |")
+        out.append("|---|---------|-------------|------------|")
+        cumulative = 0
         for i, r in enumerate(ranked, 1):
             occ = int(r.get("occurrences", 0) or 0)
-            ifaces = ", ".join(r.get("affectedInterfaces", []) or []) or DASH
-            out.append(
-                f"| {i} | {_id(r)} | {r.get('messageText') or DASH} | "
-                f"{occ} | {criticality(occ)} | {ifaces} |"
-            )
+            cumulative += occ
+            out.append(f"| {i} | {r.get('messageText') or DASH} | {occ} | {cumulative} |")
         out.append("")
 
         # Top N resolutions — SHORT: root cause + max 3 bullets, verbatim grounding.
@@ -1366,6 +1378,10 @@ def get_interface_statistics_tool(date_from: str, date_to: str) -> dict[str, Any
                 "errors": errs,
                 "warnings": int(s.get("NumberWarningMessages", 0) or 0),
                 "success": int(s.get("NumberSuccessMessages", 0) or 0),
+                # All remaining AIF statuses, so the report can show every type.
+                "inProcess": int(s.get("NumberInProcessMessages", 0) or 0),
+                "aborted": int(s.get("NumberAbortMessages", 0) or 0),
+                "canceled": int(s.get("NumberCanceledMessages", 0) or 0),
                 "health": health,
             })
         span.set_attribute("outcome", "success")
