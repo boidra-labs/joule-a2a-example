@@ -1,0 +1,31 @@
+description: >-
+  Handles SAP AIF interface monitoring requests: list interfaces, show error
+  worklists for a period or interface, interface statistics and health checks,
+  full monitoring analysis reports, message lookups by GUID, grounded error
+  resolutions, and searches by business object (customer, vendor, PO, cost
+  center). Returns a Markdown answer. Use for any query about AIF errors,
+  interface status, message details, fixes, or SAP Central Finance interface
+  health.
+
+target:
+  type: function
+  name: aif_analysis_agent
+  parameters:
+    - name: agent_context_id
+      value: $capability_context.agent_context_id
+    - name: agent_task_id
+      value: $capability_context.agent_task_id
+    - name: agent_state
+      value: $capability_context.agent_state
+
+capability_context:
+  - name: agent_context_id
+    value: $target_result.agent_context_id
+  - name: agent_task_id
+    value: $target_result.agent_task_id
+  - name: agent_state
+    value: $target_result.agent_state
+
+
+
+

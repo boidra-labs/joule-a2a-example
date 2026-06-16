@@ -1,0 +1,50 @@
+parameters:
+  - name: agent_context_id
+    optional: true
+  - name: agent_task_id
+    optional: true
+  - name: agent_state
+    optional: true
+
+action_groups:
+
+  - actions:
+      - type: status-update
+        message: "Querying AIF monitoring..."
+
+  - actions:
+      - type: agent-request
+        agent_type: remote
+        system_alias: AIF_ANALYSIS_AGENT
+        body:
+          contextId: <? agent_context_id ?>
+          # taskId: <? agent_task_id ?>
+        result_variable: _agent_response
+
+  # The agent returns the { message, intent, data } contract as the A2A `data`
+  # part of the completed artifact. Render the MARKDOWN from its `message` property.
+  - actions:
+      - type: set-variables
+        scripting_type: spel
+        variables:
+          - name: _context_id
+            value: "<? _agent_response.body.contextId ?>"
+          - name: _task_id
+            value: "<? _agent_response.body.id ?>"
+          - name: _state
+            value: "<? _agent_response.body.status.state ?>"
+          - name: _markdown
+            value: "<? _agent_response.body.artifacts[0].parts[1].data.message ?>"
+
+  - actions:
+      - type: message
+        message:
+          type: text
+          content: "<? _markdown ?>"
+          markdown: true
+
+result:
+  agent_context_id: <? _context_id ?>
+  agent_task_id: <? _task_id ?>
+  agent_state: <? _state ?>
+  agentResponse: <? _markdown ?>

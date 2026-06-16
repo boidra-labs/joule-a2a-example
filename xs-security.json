@@ -1,0 +1,17 @@
+{
+  "xsappname": "aif-analysis-agent",
+  "tenant-mode": "dedicated",
+  "scopes": [
+    {
+      "name": "$XSAPPNAME.Call",
+      "description": "Allows calling the AIF Analysis Agent"
+    }
+  ],
+  "role-templates": [
+    {
+      "name": "AgentCaller",
+      "description": "Can call the AIF Analysis Agent",
+      "scope-references": ["$XSAPPNAME.Call"]
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+variables:
+  - name: agent_context_id
+  - name: agent_task_id
+  - name: agent_state

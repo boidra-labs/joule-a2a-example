@@ -1,0 +1,16 @@
+schema_version: 3.27.0
+
+metadata:
+  display_name: AIF Analysis Agent
+  namespace: joule.ext
+  name: aif_analysis_agent
+  version: 1.0.0
+  description: >-
+    Monitors SAP AIF interfaces over AIF_SRV: lists interfaces, builds error
+    worklists and per-interface statistics/health, produces full monitoring
+    analysis reports, looks up messages by GUID, grounds error resolutions, and
+    searches by business object. Returns markdown responses for Joule chat.
+
+system_aliases:
+  AIF_ANALYSIS_AGENT:
+    destination: aif-analysis-agent
