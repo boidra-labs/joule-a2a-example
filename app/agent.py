@@ -841,6 +841,35 @@ def _resolve_date_range(period: str) -> dict[str, Any]:
 # Full analysis report builder (deterministic, testable)
 # ---------------------------------------------------------------------------
 
+# Common Unicode punctuation -> ASCII, applied before the NFKD fallback so we
+# get sensible replacements (en/em dash -> '-', smart quotes -> ', curly etc.).
+_ASCII_MAP = {
+    "—": "-", "–": "-", "‒": "-", "−": "-",   # dashes
+    "·": "-", "•": "*", "…": "...",                 # middot, bullet, ellipsis
+    "‘": "'", "’": "'", "“": '"', "”": '"',    # smart quotes
+    "→": "->", "←": "<-", "↑": "^", "↓": "v",  # arrows
+    " ": " ", "️": "",                                   # nbsp, variation selector
+}
+
+
+def _ascii(text: str) -> str:
+    """Force a string to plain ASCII for SAP Joule's markdown renderer.
+
+    Joule errors on non-ASCII (em dash, middle dot, arrows, emoji). We map the
+    common punctuation explicitly, transliterate accented letters via NFKD
+    (e.g. 'Période' -> 'Periode'), then drop anything still non-ASCII (e.g.
+    emoji). Applied to the whole report so verbatim grounding/interface text
+    can't reintroduce non-ASCII.
+    """
+    import unicodedata
+
+    for src, dst in _ASCII_MAP.items():
+        text = text.replace(src, dst)
+    # NFKD splits accented chars into base + combining mark; encode/ignore drops
+    # the marks and any remaining non-ASCII (emoji, CJK, etc.).
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
 def _build_analysis_report(
     period: str,
     date_from: str,
@@ -901,68 +930,72 @@ def _build_analysis_report(
 
     ranked = sorted(res, key=score, reverse=True)
 
-    # --- assemble Markdown ---------------------------------------------------
+    # --- assemble Markdown ----------------------------------------------------
+    # PURE ASCII ONLY. SAP Joule's renderer errors on non-ASCII (em dash, middle
+    # dot, arrows, emoji), so use '-' as the empty-field placeholder, ASCII
+    # separators, and word labels. Verbatim grounding/interface text is
+    # ASCII-normalised by _ascii() at the end.
+    DASH = "-"
     out: list[str] = []
-    out.append("# 🛰️ AIF Interface Monitoring Report")
-    out.append(f"**Period:** {period}  ·  {date_from[:10]} → {date_to[:10]}  ·  **Central Finance**\n")
+    out.append("# AIF Interface Monitoring Report")
+    out.append(f"**Period:** {period} | {date_from[:10]} to {date_to[:10]} | Central Finance\n")
 
     if has_errors and ranked:
         top = ranked[0]
         out.append(
-            f"> ⚠️ **Biggest risk:** {top.get('msgId','—')}/{top.get('msgNo','—')} "
-            f"\"{top.get('messageText','—')}\" — {top.get('occurrences',0)} occurrences "
+            f"> **Biggest risk:** {top.get('msgId', DASH)}/{top.get('msgNo', DASH)} "
+            f"\"{top.get('messageText', DASH)}\" - {top.get('occurrences', 0)} occurrences "
             f"across {len(top.get('affectedInterfaces', []) or [])} interface(s).\n"
             f"> **Do this first:** "
             f"{(top.get('resolutionSteps') or ['Review the resolution below.'])[0]}\n"
         )
 
     # Scorecard (plain text — no ASCII charts; Joule renders the markdown)
-    out.append("## 📊 Health Scorecard")
+    out.append("## Health Scorecard")
     out.append(
-        f"**Overall grade: {grade(err_pct)}**  ·  {total} messages · "
-        f"{total_errors} errors ({err_pct:.1f}%) · {total_success} ok\n"
+        f"**Overall grade: {grade(err_pct)}** | {total} messages | "
+        f"{total_errors} errors ({err_pct:.1f}%) | {total_success} ok\n"
     )
 
     # Active interfaces. "Error %" = this interface's share of all errors, which
     # replaces the former ASCII error-share bar chart.
-    out.append("## 🟢 Active Interfaces (traffic in period)")
+    out.append("## Active Interfaces (traffic in period)")
     out.append("| Interface | Version | Total | Errors | Error % | Warnings | Success | Health |")
     out.append("|-----------|---------|-------|--------|---------|----------|---------|--------|")
-    health_icon = {"Critical": "🔴 Critical", "Warning": "🟠 Warning", "Healthy": "🟢 Healthy"}
     for s in sorted(active, key=lambda s: int(s.get("errors", 0) or 0), reverse=True):
         e = int(s.get("errors", 0) or 0)
         share = (100.0 * e / total_errors) if total_errors else 0.0
         out.append(
-            f"| {s.get('interfaceName','—')} | {s.get('interfaceVersion','—')} | "
-            f"{s.get('total',0)} | {e} | {share:.1f}% | {s.get('warnings',0)} | "
-            f"{s.get('success',0)} | {health_icon.get(s.get('health',''), s.get('health','—'))} |"
+            f"| {s.get('interfaceName', DASH)} | {s.get('interfaceVersion', DASH)} | "
+            f"{s.get('total', 0)} | {e} | {share:.1f}% | {s.get('warnings', 0)} | "
+            f"{s.get('success', 0)} | {s.get('health', DASH)} |"
         )
     if not active:
-        out.append("| — | — | 0 | 0 | 0.0% | 0 | 0 | 🟢 Healthy |")
+        out.append("| - | - | 0 | 0 | 0.0% | 0 | 0 | Healthy |")
     out.append("")
 
     # Prioritized action plan
     if has_errors and ranked:
-        out.append("## 🎯 Prioritized Action Plan")
+        out.append("## Prioritized Action Plan")
         out.append("| # | Error | Affected interfaces | Occurrences | Restart-safe | Priority |")
         out.append("|---|-------|---------------------|-------------|--------------|----------|")
         n = len(ranked)
         for i, r in enumerate(ranked, 1):
-            band = "↑ High" if i <= max(1, n // 3) else ("→ Medium" if i <= max(2, 2 * n // 3) else "↓ Low")
-            ifaces = ", ".join(r.get("affectedInterfaces", []) or []) or "—"
+            band = "High" if i <= max(1, n // 3) else ("Medium" if i <= max(2, 2 * n // 3) else "Low")
+            ifaces = ", ".join(r.get("affectedInterfaces", []) or []) or DASH
             out.append(
-                f"| {i} | {r.get('msgId','—')}/{r.get('msgNo','—')} | {ifaces} | "
-                f"{r.get('occurrences',0)} | {'✅' if r.get('restartSafe') else '⚠️ no'} | {band} |"
+                f"| {i} | {r.get('msgId', DASH)}/{r.get('msgNo', DASH)} | {ifaces} | "
+                f"{r.get('occurrences', 0)} | {'yes' if r.get('restartSafe') else 'no'} | {band} |"
             )
         out.append("")
 
         # Error resolutions (per distinct MSGID/MSGNO) — verbatim grounding
-        out.append("## 🛠️ Error Resolutions")
+        out.append("## Error Resolutions")
         for r in ranked:
-            out.append(f"### {r.get('msgId','—')}/{r.get('msgNo','—')} — \"{r.get('messageText','—')}\"")
+            out.append(f"### {r.get('msgId', DASH)}/{r.get('msgNo', DASH)} - \"{r.get('messageText', DASH)}\"")
             out.append(
-                f"**Affected:** {', '.join(r.get('affectedInterfaces', []) or []) or '—'} · "
-                f"**Occurrences:** {r.get('occurrences',0)} · "
+                f"**Affected:** {', '.join(r.get('affectedInterfaces', []) or []) or DASH} | "
+                f"**Occurrences:** {r.get('occurrences', 0)} | "
                 f"**Restart-safe:** {'yes' if r.get('restartSafe') else 'no'}\n"
             )
             out.append(f"**Root Cause:** {r.get('rootCause') or 'No resolution guidance available in the document catalog for this error.'}")
@@ -979,9 +1012,9 @@ def _build_analysis_report(
         if gt > len(res):
             out.append(f"_+{gt - len(res)} more distinct error(s) not grounded (showing top {len(res)} by frequency)._")
     else:
-        out.append("> ✅ **Healthy** — no errors in this period. Nothing to resolve.")
+        out.append("> **Healthy** - no errors in this period. Nothing to resolve.")
 
-    return {"report": "\n".join(out).strip() + "\n"}
+    return {"report": _ascii("\n".join(out).strip() + "\n")}
 
 
 @tool
@@ -1442,6 +1475,12 @@ class CodemineAgent:
             if isinstance(parsed, dict) and parsed.get("intent") == "analysis":
                 parsed["message"] = draft
                 parsed["data"] = None
+            # SAP Joule's markdown renderer errors on non-ASCII (em dash, middle
+            # dot, arrows, emoji). The finalizer LLM tends to emit those in the
+            # message fallback, so force the rendered field to plain ASCII for
+            # EVERY intent. (Analysis is already ASCII from the builder.)
+            if isinstance(parsed, dict) and isinstance(parsed.get("message"), str):
+                parsed["message"] = _ascii(parsed["message"])
             # Validate/normalise through CardEnvelope so the shape is consistent
             # (fills defaults, coerces types). Falls back to the raw dict if the
             # envelope can't validate but the JSON is still usable.

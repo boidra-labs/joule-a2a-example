@@ -9,18 +9,34 @@ from app.schemas import CardResponse
 
 
 # The exact transform applied in AIFAgent._finalize_structured for analysis.
+from app.agent import _ascii
+
+
 def _apply_analysis_override(parsed: dict, draft: str) -> dict:
     if isinstance(parsed, dict) and parsed.get("intent") == "analysis":
         parsed["message"] = draft
         parsed["data"] = None
+    if isinstance(parsed.get("message"), str):
+        parsed["message"] = _ascii(parsed["message"])
     return CardResponse(**parsed).model_dump()
 
 
+def test_finalizer_message_forced_to_ascii_for_all_intents():
+    # Non-analysis intent whose LLM message has em dash + emoji must be ASCII.
+    card = {"intent": "statistics", "message": "Health \U0001F7E2 OK — all good · done",
+            "data": {"interfaceCount": 1, "interfaces": []}}
+    out = _apply_analysis_override(dict(card), "draft")
+    out["message"].encode("ascii")  # must not raise
+    assert "—" not in out["message"] and "\U0001F7E2" not in out["message"]
+
+
+# The real builder draft is already plain ASCII (no emoji / em dash) so Joule
+# can render it.
 _REPORT = (
-    "# 🛰️ AIF Interface Monitoring Report\n"
-    "## 🟢 Active Interfaces (traffic in period)\n"
+    "# AIF Interface Monitoring Report\n"
+    "## Active Interfaces (traffic in period)\n"
     "| Interface | Version | Total | Errors | Error % | Warnings | Success | Health |\n"
-    "| FINEXTBANK | 1 | 320 | 41 | 65.1% | 5 | 274 | 🔴 Critical |\n"
+    "| FINEXTBANK | 1 | 320 | 41 | 65.1% | 5 | 274 | Critical |\n"
 )
 
 

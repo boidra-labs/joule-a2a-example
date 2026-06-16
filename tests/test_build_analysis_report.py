@@ -73,6 +73,30 @@ def test_no_ascii_charts_for_joule():
         assert blk not in r
 
 
+def test_report_is_pure_ascii_for_joule():
+    """Joule errors on non-ASCII (em-dash, middle dot, arrows, emoji). The whole
+    report — including verbatim grounding/interface text — must be plain ASCII."""
+    r = _report(grounded_total=8)
+    offenders = sorted({ch for ch in r if ord(ch) > 127})
+    assert not offenders, f"non-ASCII chars leaked into report: {offenders}"
+    # encodes cleanly as ASCII (the operation Joule's transport effectively does)
+    r.encode("ascii")
+
+
+def test_non_ascii_grounding_text_is_normalised():
+    """Verbatim grounding/interface content with non-ASCII must not break ASCII."""
+    res = [dict(_RES[0], rootCause="Période non ouverte — fiscal", messageText="naïve—text")]
+    stats = [dict(_STATS[0], interfaceName="FÍNEXTBÄNK")]
+    r = _build_analysis_report(
+        period="2023", date_from="2023-01-01T00:00:00Z", date_to="2023-12-31T23:59:59Z",
+        statistics=stats, error_rows=[], resolutions=res, grounded_total=1,
+    )["report"]
+    r.encode("ascii")  # must not raise
+    # accented letters are transliterated, not dropped: "Période" -> "Periode"
+    assert "Periode non ouverte" in r
+    assert "FINEXTBANK" in r
+
+
 def test_error_share_percent_column():
     # FINEXTBANK: 41 errors / 63 total errors ≈ 65.1%
     r = _report()
