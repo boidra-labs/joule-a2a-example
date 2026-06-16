@@ -103,6 +103,33 @@ def test_error_share_percent_column():
     assert "65.1%" in r
 
 
+def test_scorecard_breaks_down_all_message_types():
+    """Scorecard must report success/warning/error counts AND percentages,
+    computed across all message types (not just errors)."""
+    # totals: 620 msgs; errors 63; warnings 5+2+0+0=7; success 274+176+100+0=550
+    r = _report()
+    assert "620 messages" in r
+    assert "550 success" in r or "Success: 550" in r
+    # warnings surfaced
+    assert "7 warning" in r.lower() or "warning: 7" in r.lower()
+    # success rate computed (550/620 = 88.7%)
+    assert "88.7%" in r
+
+
+def test_status_percentages_sum_consistently():
+    # 1 interface: 100 total = 10 err + 20 warn + 70 success
+    stats = [{"namespace": "N", "interfaceName": "X", "interfaceVersion": "1",
+              "total": 100, "errors": 10, "warnings": 20, "success": 70, "health": "Critical"}]
+    res = [dict(_RES[0], occurrences=10, affectedInterfaces=["X"])]
+    r = _build_analysis_report(period="2024", date_from="2024-01-01T00:00:00Z",
+                               date_to="2024-12-31T23:59:59Z", statistics=stats,
+                               error_rows=[], resolutions=res, grounded_total=1)["report"]
+    assert "100 messages" in r
+    assert "70 success (70.0%)" in r
+    assert "20 warning (20.0%)" in r
+    assert "10 error (10.0%)" in r
+
+
 def test_grade_reflects_error_percentage():
     # 63 errors / 620 total ≈ 10.2% -> grade D (<15%)
     r = _report()

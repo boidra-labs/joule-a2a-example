@@ -451,12 +451,15 @@ when several genuinely match. Never invent a GUID or interface.
     analysis — use rule 23 instead.
 
 The full report Markdown is assembled deterministically by build_analysis_report_tool
-(rule 9): a health scorecard with a letter grade, an Active Interfaces table
-(interfaces with traffic in the period, including each interface's error share %),
-a prioritized action plan, a risk callout, and per-MSGID/MSGNO error resolutions.
-The report is plain Markdown tables/text only — no ASCII charts — so SAP Joule renders
-it cleanly. You never hand-build these sections — you only feed the tool the
-statistics, error rows, and grounded resolutions, then return its output unchanged.
+(rule 9): a health scorecard with a letter grade, a success rate, and a breakdown of
+ALL message types (success / warning / error / other, with counts and percentages
+computed from the statistics — not just errors); an Active Interfaces table
+(interfaces with traffic in the period, including each interface's error share %);
+a prioritized action plan; a risk callout; and per-MSGID/MSGNO error resolutions
+(resolutions remain ERROR-only). The report is plain ASCII Markdown tables/text only —
+no charts, no emoji/icons — so SAP Joule renders it cleanly. You never hand-build these
+sections — you only feed the tool the statistics, error rows, and grounded resolutions,
+then return its output unchanged.
 """
 
 
@@ -904,8 +907,16 @@ def _build_analysis_report(
     res = resolutions or []
     total = sum(int(s.get("total", 0) or 0) for s in stats)
     total_errors = sum(int(s.get("errors", 0) or 0) for s in stats)
+    total_warnings = sum(int(s.get("warnings", 0) or 0) for s in stats)
     total_success = sum(int(s.get("success", 0) or 0) for s in stats)
-    err_pct = (100.0 * total_errors / total) if total else 0.0
+    # Anything not classified S/W/E (e.g. in-progress P / other X). Never negative.
+    total_other = max(0, total - total_errors - total_warnings - total_success)
+
+    def pct(n: int) -> float:
+        return (100.0 * n / total) if total else 0.0
+
+    err_pct = pct(total_errors)
+    success_rate = pct(total_success)
 
     def grade(pct: float) -> str:
         if pct < 1:
@@ -950,12 +961,21 @@ def _build_analysis_report(
             f"{(top.get('resolutionSteps') or ['Review the resolution below.'])[0]}\n"
         )
 
-    # Scorecard (plain text — no ASCII charts; Joule renders the markdown)
+    # Scorecard (plain text — no ASCII charts; Joule renders the markdown).
+    # Calculation covers ALL message types (success / warning / error / other),
+    # not just errors, from the per-interface statistics.
     out.append("## Health Scorecard")
     out.append(
-        f"**Overall grade: {grade(err_pct)}** | {total} messages | "
-        f"{total_errors} errors ({err_pct:.1f}%) | {total_success} ok\n"
+        f"**Overall grade: {grade(err_pct)}** | "
+        f"**Success rate: {success_rate:.1f}%** | {total} messages\n"
     )
+    out.append("**Message breakdown (all types):**")
+    out.append(f"- {total_success} success ({pct(total_success):.1f}%)")
+    out.append(f"- {total_warnings} warning ({pct(total_warnings):.1f}%)")
+    out.append(f"- {total_errors} error ({pct(total_errors):.1f}%)")
+    if total_other:
+        out.append(f"- {total_other} other/in-progress ({pct(total_other):.1f}%)")
+    out.append("")
 
     # Active interfaces. "Error %" = this interface's share of all errors, which
     # replaces the former ASCII error-share bar chart.
