@@ -270,7 +270,10 @@ class CardEnvelope(BaseModel):
 
     intent: str = Field(description="One of: " + ", ".join(INTENTS) + ".")
     message: str = Field(description="Markdown fallback of the answer.")
-    data: CardData = Field(default_factory=CardData, description="Per-intent payload; fill only the chosen intent's fields.")
+    data: Optional[CardData] = Field(
+        default_factory=CardData,
+        description="Per-intent payload; fill only the chosen intent's fields. Null for analysis (the report lives in `message`).",
+    )
 
 
 # Bound by the finalizer in agent.py.

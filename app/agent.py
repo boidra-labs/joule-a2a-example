@@ -467,9 +467,9 @@ Pick `intent` from what the user asked for and which tools ran:
 - message_detail — a GUID read. data = { messageGuid, interface, logCount, logEntries:[{msgType, msgId, msgNo, text}] }.
 - business_key — a business object (customer, vendor, cost center, PO…). data = { mode:'interfaces'|'messages', count, interfaces:[...] or messages:[...] }.
 - resolution — "fix/resolve message <GUID>". data = { messageGuid, interface, errorCount, summary, errors:[{msgId, msgNo, messageText, rootCause, resolutionSteps[], restartSafe, grounded, sourceText}] }. sourceText is ALWAYS set: '[title](webUrl)' when a doc matched, else 'SAP standard documentation for <msgId>/<msgNo>'.
-- analysis — a full monitoring report / overview. Put the ENTIRE Markdown report in `message`; leave `data` null.
+- analysis — a full monitoring report / overview. Set intent='analysis' and leave `data` null. (The full Markdown report from build_analysis_report_tool is the assistant draft; it is copied into `message` verbatim by the agent — do NOT rewrite, shorten, or relocate it.)
 
-STRICT GROUNDING: copy values ONLY from the tool results and the assistant draft. Never invent interfaces, counts, error codes, root causes, or resolution steps. If a field is unknown use "—" (text) or 0 (number). `message` is a concise Markdown fallback of the same content."""
+STRICT GROUNDING: copy values ONLY from the tool results and the assistant draft. Never invent interfaces, counts, error codes, root causes, or resolution steps. If a field is unknown use "—" (text) or 0 (number). Except for analysis (handled above), `message` is a concise Markdown fallback of the same content."""
 
 
 # ---------------------------------------------------------------------------
@@ -1382,6 +1382,14 @@ class CodemineAgent:
             result = await self.finalizer.ainvoke(transcript)
             raw = result.content if hasattr(result, "content") else str(result)
             parsed = json.loads(raw)
+            # The analysis report is assembled VERBATIM by build_analysis_report_tool
+            # and is already the assistant draft. Joule renders it from
+            # data.message (parts[1].data.message), so put the draft there
+            # unchanged — never let the finalizer LLM re-summarise or relocate the
+            # long Markdown report (it would land in the wrong field / be truncated).
+            if isinstance(parsed, dict) and parsed.get("intent") == "analysis":
+                parsed["message"] = draft
+                parsed["data"] = None
             # Validate/normalise through CardEnvelope so the shape is consistent
             # (fills defaults, coerces types). Falls back to the raw dict if the
             # envelope can't validate but the JSON is still usable.
