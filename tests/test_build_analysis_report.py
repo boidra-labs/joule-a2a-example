@@ -59,19 +59,30 @@ def test_active_interfaces_excludes_zero_traffic():
     r = _report()
     assert "FINEXTBANK" in r and "ORDERS" in r and "PAYMENTS" in r
     assert "IDLE" not in r  # total == 0 -> not active
-    # table header present (not just rows)
-    assert "| Interface | Version | Total | Errors | Warnings | Success | Health |" in r
+    # table header present (not just rows), with the Error % column
+    assert "| Interface | Version | Total | Errors | Error % | Warnings | Success | Health |" in r
+
+
+def test_no_ascii_charts_for_joule():
+    """Joule mangles Unicode bar charts / code fences — none must appear."""
+    r = _report()
+    assert "```" not in r          # no fenced chart block
+    assert "█" not in r            # no bar glyphs
+    assert "trend" not in r.lower()  # no sparkline section
+    for blk in "▁▂▃▄▅▆▇":
+        assert blk not in r
+
+
+def test_error_share_percent_column():
+    # FINEXTBANK: 41 errors / 63 total errors ≈ 65.1%
+    r = _report()
+    assert "65.1%" in r
 
 
 def test_grade_reflects_error_percentage():
     # 63 errors / 620 total ≈ 10.2% -> grade D (<15%)
     r = _report()
     assert "grade: D" in r
-
-
-def test_error_share_bars_present_and_scaled():
-    r = _report()
-    assert "█" in r  # full bar for the max (FINEXTBANK, 41 errors)
 
 
 def test_priority_plan_orders_by_score():

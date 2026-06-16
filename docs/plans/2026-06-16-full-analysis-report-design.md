@@ -5,9 +5,13 @@ Expand the AIF **analysis** intent (rules 1-10) into a full-coverage monitoring
 report for a specific period, adding:
 - an **active interface list** (interfaces with traffic in the period),
 - **all error resolutions in a table, per MSGID/MSGNO** (top 5 distinct, grounded),
-- four value-add visuals: **health scorecard + error-share bars**, **error-trend
-  sparkline**, **prioritized action plan**, **risk callout box**,
+- value-adds: **health scorecard**, **prioritized action plan**, **risk callout
+  box**, and a per-interface **error share %** column,
 - a redesigned Markdown response.
+
+> Update: ASCII charts (error-share bars + trend sparkline) were removed because
+> SAP Joule does not render Unicode block charts / code fences cleanly. The
+> error-share insight is now an "Error %" column in the Active Interfaces table.
 
 ## Key decision: deterministic Python builder
 LLMs miscompute bar lengths, daily buckets, and weighted ranking from raw rows.

@@ -440,10 +440,11 @@ when several genuinely match. Never invent a GUID or interface.
     analysis — use rule 23 instead.
 
 The full report Markdown is assembled deterministically by build_analysis_report_tool
-(rule 9): a health scorecard with a letter grade and per-interface error-share bars,
-an error-trend sparkline, an Active Interfaces table (interfaces with traffic in the
-period), a prioritized action plan, a risk callout, and per-MSGID/MSGNO error
-resolutions. You never hand-build these sections — you only feed the tool the
+(rule 9): a health scorecard with a letter grade, an Active Interfaces table
+(interfaces with traffic in the period, including each interface's error share %),
+a prioritized action plan, a risk callout, and per-MSGID/MSGNO error resolutions.
+The report is plain Markdown tables/text only — no ASCII charts — so SAP Joule renders
+it cleanly. You never hand-build these sections — you only feed the tool the
 statistics, error rows, and grounded resolutions, then return its output unchanged.
 """
 
@@ -799,16 +800,18 @@ def _build_analysis_report(
 ) -> dict[str, Any]:
     """Assemble the full AIF monitoring report as Markdown. Pure function.
 
-    All visuals (grade, error-share bars, trend sparkline, priority order) are
-    computed here so they are exact and consistent. Grounding text from
+    All metrics (grade, per-interface error share %, priority order) are computed
+    here so they are exact and consistent. Output is plain Markdown tables/text
+    only — no ASCII charts — so SAP Joule renders it cleanly. Grounding text from
     `resolutions` is placed VERBATIM — never edited or invented.
 
     Args:
         period:        the user's free-text period (echoed in the header).
-        date_from/to:  resolved V4 bounds (used for the trend axis).
-        statistics:    interfaces[] from get_interface_statistics_tool.
-        error_rows:    messages[] from list_error_messages_tool (logMessage,
-                       processDate, interfaceName).
+        date_from/to:  resolved V4 bounds (echoed in the header).
+        statistics:    interfaces[] from get_interface_statistics_tool — drives
+                       all counts and the per-interface error share %.
+        error_rows:    messages[] from list_error_messages_tool. Accepted for the
+                       analysis contract; currently not rendered directly.
         resolutions:   grounded error entries (top distinct), each:
                        {msgId, msgNo, messageText, affectedInterfaces[],
                         occurrences, restartSafe, rootCause, resolutionSteps[],
@@ -816,10 +819,7 @@ def _build_analysis_report(
         grounded_total: distinct error count that existed (for the truncation
                         note). Defaults to len(resolutions).
     """
-    import re as _re
-
     stats = statistics or []
-    errs = error_rows or []
     res = resolutions or []
     total = sum(int(s.get("total", 0) or 0) for s in stats)
     total_errors = sum(int(s.get("errors", 0) or 0) for s in stats)
@@ -837,42 +837,8 @@ def _build_analysis_report(
             return "D"
         return "F"
 
-    def bar(val: int, maxval: int, width: int = 20) -> str:
-        if maxval <= 0:
-            return "░" * width
-        filled = round(width * val / maxval)
-        return "█" * filled + "░" * (width - filled)
-
     active = [s for s in stats if int(s.get("total", 0) or 0) > 0]
     has_errors = total_errors > 0 and bool(res)
-
-    # --- daily error trend (sparkline) ---------------------------------------
-    def _epoch_day(row) -> str | None:
-        pd = str(row.get("processDate", ""))
-        m = _re.search(r"/Date\((\d+)", pd)             # OData V2 /Date(ms)/
-        if m:
-            from datetime import datetime, timezone
-            return datetime.fromtimestamp(int(m.group(1)) / 1000, timezone.utc).strftime("%m-%d")
-        m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", pd)   # V4 ISO
-        if m:
-            return f"{m.group(2)}-{m.group(3)}"
-        return None
-
-    day_counts: dict[str, int] = {}
-    for row in errs:
-        d = _epoch_day(row)
-        if d:
-            day_counts[d] = day_counts.get(d, 0) + 1
-    spark = ""
-    if day_counts:
-        blocks = "▁▂▃▄▅▆▇█"
-        days = sorted(day_counts)
-        mx = max(day_counts.values())
-        cells = []
-        for d in days:
-            idx = round((len(blocks) - 1) * day_counts[d] / mx) if mx else 0
-            cells.append(f"{d} {blocks[idx]}")
-        spark = "  ".join(cells)
 
     # --- prioritized action plan ---------------------------------------------
     def score(r) -> float:
@@ -898,40 +864,29 @@ def _build_analysis_report(
             f"{(top.get('resolutionSteps') or ['Review the resolution below.'])[0]}\n"
         )
 
-    # Scorecard
+    # Scorecard (plain text — no ASCII charts; Joule renders the markdown)
     out.append("## 📊 Health Scorecard")
     out.append(
         f"**Overall grade: {grade(err_pct)}**  ·  {total} messages · "
         f"{total_errors} errors ({err_pct:.1f}%) · {total_success} ok\n"
     )
-    if active:
-        max_err = max((int(s.get("errors", 0) or 0) for s in active), default=0)
-        out.append("Error share by interface:\n")
-        out.append("```")
-        for s in sorted(active, key=lambda s: int(s.get("errors", 0) or 0), reverse=True):
-            name = (s.get("interfaceName", "—") or "—")[:14].ljust(14)
-            e = int(s.get("errors", 0) or 0)
-            out.append(f"{name}{bar(e, max_err)}  {e}")
-        out.append("```\n")
 
-    # Trend
-    if spark:
-        out.append("## 📈 Error trend (per day)")
-        out.append(f"`{spark}`\n")
-
-    # Active interfaces
+    # Active interfaces. "Error %" = this interface's share of all errors, which
+    # replaces the former ASCII error-share bar chart.
     out.append("## 🟢 Active Interfaces (traffic in period)")
-    out.append("| Interface | Version | Total | Errors | Warnings | Success | Health |")
-    out.append("|-----------|---------|-------|--------|----------|---------|--------|")
+    out.append("| Interface | Version | Total | Errors | Error % | Warnings | Success | Health |")
+    out.append("|-----------|---------|-------|--------|---------|----------|---------|--------|")
     health_icon = {"Critical": "🔴 Critical", "Warning": "🟠 Warning", "Healthy": "🟢 Healthy"}
-    for s in active:
+    for s in sorted(active, key=lambda s: int(s.get("errors", 0) or 0), reverse=True):
+        e = int(s.get("errors", 0) or 0)
+        share = (100.0 * e / total_errors) if total_errors else 0.0
         out.append(
             f"| {s.get('interfaceName','—')} | {s.get('interfaceVersion','—')} | "
-            f"{s.get('total',0)} | {s.get('errors',0)} | {s.get('warnings',0)} | "
+            f"{s.get('total',0)} | {e} | {share:.1f}% | {s.get('warnings',0)} | "
             f"{s.get('success',0)} | {health_icon.get(s.get('health',''), s.get('health','—'))} |"
         )
     if not active:
-        out.append("| — | — | 0 | 0 | 0 | 0 | 🟢 Healthy |")
+        out.append("| — | — | 0 | 0 | 0.0% | 0 | 0 | 🟢 Healthy |")
     out.append("")
 
     # Prioritized action plan
