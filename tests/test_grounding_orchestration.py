@@ -8,7 +8,36 @@ same shape the analysis flow expects: {match, rootCause, resolutionSteps[], ...}
 """
 import json
 
-from app.agent import _parse_orchestration_grounding, _split_error_query
+from app.agent import (
+    _parse_orchestration_grounding,
+    _split_error_query,
+    _orchestration_payload,
+)
+
+
+def test_payload_has_inline_config_and_placeholder_values():
+    p = _orchestration_payload("AIF", "099", "Processing terminated")
+    # placeholder values carry the actual error fields
+    assert p["placeholder_values"] == {
+        "errorId": "AIF", "errorNumber": "099",
+        "errorMessage": "Processing terminated",
+    }
+    mods = p["config"]["modules"]
+    # grounding module: help.sap.com repository, declared input/output placeholders
+    g = mods["grounding"]["config"]
+    assert g["filters"][0]["data_repository_type"] == "help.sap.com"
+    assert g["filters"][0]["data_repositories"] == ["*"]
+    assert g["placeholders"]["input"] == ["errorId", "errorNumber", "errorMessage"]
+    assert g["placeholders"]["output"] == "groundingOutput"
+    # prompt template references all four placeholders
+    tmpl = mods["prompt_templating"]["prompt"]["template"]
+    user_msg = next(m["content"] for m in tmpl if m["role"] == "user")
+    assert "{{?errorId}}" in user_msg
+    assert "{{?errorNumber}}" in user_msg
+    assert "{{?errorMessage}}" in user_msg
+    assert "{{?groundingOutput}}" in user_msg
+    # model wired
+    assert mods["prompt_templating"]["model"]["name"]  # non-empty
 
 
 def test_split_error_query_id_number_message():

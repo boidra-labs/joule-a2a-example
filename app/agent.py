@@ -90,12 +90,9 @@ GROUNDING_MODE = os.environ.get("GROUNDING_MODE", "retrieval").strip().lower()
 # when GROUNDING_MODE=orchestration). e.g.
 # https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<id>/v2/completion
 GROUNDING_ORCH_URL = os.environ.get("AICORE_ORCH_COMPLETION_URL", "")
-# input_params key names the orchestration template expects (deployment-specific).
-# The AIF deployment fills Error ID / Number / Message separately. Override via
-# env if the deployment uses different names, without a redeploy.
-GROUNDING_ORCH_PARAM_ID = os.environ.get("AICORE_ORCH_PARAM_ID", "error_id")
-GROUNDING_ORCH_PARAM_NUMBER = os.environ.get("AICORE_ORCH_PARAM_NUMBER", "error_number")
-GROUNDING_ORCH_PARAM_MESSAGE = os.environ.get("AICORE_ORCH_PARAM_MESSAGE", "error_message")
+# Orchestration model (sent inline in config.modules.prompt_templating.model).
+GROUNDING_ORCH_MODEL = os.environ.get("AICORE_ORCH_MODEL", "gpt-4.1")
+GROUNDING_ORCH_MODEL_VERSION = os.environ.get("AICORE_ORCH_MODEL_VERSION", "latest")
 
 # Context var set by stream() so tool functions can read the current user/session key
 # without needing an extra parameter threaded through LangGraph.
@@ -441,10 +438,14 @@ when several genuinely match. Never invent a GUID or interface.
 23. "health check", "which interfaces are healthy/failing", "statistics", "error
     counts per interface" for a period -> resolve dates, then
     get_interface_statistics_tool(date_from, date_to). This is the statistics/health
-    intent: respond with a SHORT per-interface health summary ONLY (a brief table or
-    list of interface -> total/errors/health). Do NOT produce the big "Interface
-    Monitoring Analysis Report" template and do NOT append the action menu — that
-    template belongs to the analysis intent (rule 27) only.
+    intent: respond with a SHORT per-interface health summary as a Markdown table.
+    The table MUST include a column for EVERY message type returned by the tool, not
+    just errors: Interface | Total | Success | Warnings | Errors | In-Process | Health.
+    Always show the Success, Warnings and In-Process columns even when their value is
+    0 — never omit message types. Copy the counts verbatim from the tool's
+    interfaces[] (total, success, warnings, errors, inProcess, health). Do NOT produce
+    the big "Interface Monitoring Analysis Report" template and do NOT append the
+    action menu — that template belongs to the analysis intent (rule 27) only.
 24. A business object (customer, vendor, business partner, cost center, PO, sales
     order, material, company code…): call get_key_fields_tool to map the object term
     to its key field (match on Label/SemObj). If the user gave a VALUE, then call
@@ -497,7 +498,7 @@ You are given: the user's request, the tools that were called and their JSON res
 Pick `intent` from what the user asked for and which tools ran:
 - interface_list — "which/list interfaces available". data = { count, interfaces:[{namespace, interfaceName, interfaceVersion, sapModule, about, searchBy}] }.
 - worklist — "list/show errors for a period/interface". data = { count, messages:[{messageGuid, namespace, interfaceName, interfaceVersion, status, processDate, logMessage}] }.
-- statistics / health — "health check", "statistics", "error counts per interface". data = { interfaceCount, interfaces:[{namespace, interfaceName, interfaceVersion, total, errors, warnings, success, inProcess, aborted, canceled, health}] }. total = all message types. health = Critical (6+ errors) / Warning (1-5) / Healthy (0).
+- statistics / health — "health check", "statistics", "error counts per interface". data = { interfaceCount, interfaces:[{namespace, interfaceName, interfaceVersion, total, errors, warnings, success, inProcess, aborted, canceled, health}] }. total = all message types. health = Critical (6+ errors) / Warning (1-5) / Healthy (0). The `message` MUST be a Markdown table with a column for EVERY message type — Interface | Total | Success | Warnings | Errors | In-Process | Health — showing Success/Warnings/In-Process even when 0. Never reduce it to errors only.
 - message_detail — a GUID read. data = { messageGuid, interface, logCount, logEntries:[{msgType, msgId, msgNo, text}] }.
 - business_key — a business object (customer, vendor, cost center, PO…). data = { mode:'interfaces'|'messages', count, interfaces:[...] or messages:[...] }.
 - resolution — "fix/resolve message <GUID>". data = { messageGuid, interface, errorCount, summary, errors:[{msgId, msgNo, messageText, rootCause, resolutionSteps[], restartSafe, grounded, sourceText}] }. sourceText is ALWAYS set: '[title](webUrl)' when a doc matched, else 'SAP standard documentation for <msgId>/<msgNo>'.
@@ -552,6 +553,86 @@ def run_analysis_tool(period: str) -> dict[str, Any]:
             span.set_attribute("outcome", "error")
             span.set_attribute("error.message", str(exc))
             return {"error": str(exc), "interfaceSummary": None}
+
+
+_ORCH_SYSTEM_PROMPT = (
+    "You are an SAP Application Interface Framework (AIF) error-resolution "
+    "assistant supporting interface monitoring. Given an interface error "
+    "identified by an error ID and an error number, diagnose the most likely "
+    "root cause and produce concrete, ordered resolution steps. Ground every "
+    "recommendation strictly in the supplied reference material (SAP Help and the "
+    "customer's internal knowledge repository). Do not invent transaction codes, "
+    "tables, SAP Notes, or configuration paths that are not supported by the "
+    "references. If the references are insufficient to resolve the error, set "
+    "resolvable_from_references to false, lower the confidence, and say what "
+    "additional information is needed in root_cause. Keep steps short with max 3 "
+    "steps and simple to understand. Respond with a single valid JSON object that "
+    "conforms exactly to the required schema with 'root_cause', 'id' and "
+    "'resolution_step' - no prose, no markdown, nothing outside the JSON."
+)
+
+_ORCH_USER_TEMPLATE = (
+    "Resolve the following AIF interface monitoring error.\n\n"
+    "Error ID: {{?errorId}}\nError Number: {{?errorNumber}}\n"
+    "Error Message: {{?errorMessage}}\n\n"
+    "Reference material:\n{{?groundingOutput}}"
+)
+
+
+def _orchestration_payload(error_id: str, error_number: str, error_message: str) -> dict[str, Any]:
+    """Build the inline-config AI Core Orchestration /completion request body.
+
+    Sends the full module config (document grounding over help.sap.com + a prompt
+    template) plus placeholder_values for this error. The grounding module reads
+    errorId/errorNumber/errorMessage, retrieves reference material, and injects it
+    as groundingOutput into the prompt; the LLM returns the grounded resolution
+    JSON. Pure (no I/O) so it is unit-testable.
+    """
+    return {
+        "config": {
+            "modules": {
+                "grounding": {
+                    "type": "document_grounding_service",
+                    "config": {
+                        "filters": [{
+                            "id": "filter1",
+                            "data_repositories": ["*"],
+                            "search_config": {},
+                            "data_repository_type": "help.sap.com",
+                            "document_metadata": [],
+                        }],
+                        "placeholders": {
+                            "input": ["errorId", "errorNumber", "errorMessage"],
+                            "output": "groundingOutput",
+                        },
+                    },
+                },
+                "prompt_templating": {
+                    "prompt": {
+                        "template": [
+                            {"role": "system", "content": _ORCH_SYSTEM_PROMPT},
+                            {"role": "user", "content": _ORCH_USER_TEMPLATE},
+                        ],
+                    },
+                    "model": {
+                        "name": GROUNDING_ORCH_MODEL,
+                        "version": GROUNDING_ORCH_MODEL_VERSION,
+                        "params": {
+                            "max_completion_tokens": 150,
+                            "temperature": 0.1,
+                            "frequency_penalty": 0,
+                            "presence_penalty": 0,
+                        },
+                    },
+                },
+            },
+        },
+        "placeholder_values": {
+            "errorId": error_id,
+            "errorNumber": error_number,
+            "errorMessage": error_message,
+        },
+    }
 
 
 def _split_error_query(query: str) -> tuple[str, str, str]:
@@ -715,11 +796,7 @@ def run_doc_error_catalog_tool(query: str) -> dict[str, Any]:
                     span.set_attribute("outcome", "misconfigured")
                     return {"error": "AICORE_ORCH_COMPLETION_URL not configured", "match": False}
                 err_id, err_no, err_msg = _split_error_query(query)
-                orch_payload = {"input_params": {
-                    GROUNDING_ORCH_PARAM_ID: err_id,
-                    GROUNDING_ORCH_PARAM_NUMBER: err_no,
-                    GROUNDING_ORCH_PARAM_MESSAGE: err_msg,
-                }}
+                orch_payload = _orchestration_payload(err_id, err_no, err_msg)
                 with httpx.Client(timeout=60) as client:
                     resp = client.post(
                         GROUNDING_ORCH_URL,
