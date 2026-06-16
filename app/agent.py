@@ -67,6 +67,17 @@ AICORE_GROUNDING_REPOSITORY = os.environ.get(
     "AICORE_GROUNDING_REPOSITORY", "a7554f34-629a-4433-8548-8c736ffbef55"
 )
 
+# Minimum vector-similarity score (chunk aggregatedScore, 0..1) for a grounding
+# hit to count as a real match. Below this the retriever only returned weak
+# nearest-neighbours (no catalog entry for the error) and we must NOT present
+# them as the answer. Calibrated from live scores against this catalog:
+#   good  "resolution steps for KI/260" -> best chunk 0.52  (doc exists)
+#   bogus "partner function SP missing" -> best chunk 0.39  (no doc)
+# 0.45 sits cleanly between them. Tunable without redeploy via this env var
+# (raise toward 0.50 if false positives persist, lower if real lookups are
+# wrongly rejected).
+AICORE_GROUNDING_MIN_SCORE = float(os.environ.get("AICORE_GROUNDING_MIN_SCORE", "0.45"))
+
 # Context var set by stream() so tool functions can read the current user/session key
 # without needing an extra parameter threaded through LangGraph.
 _current_session_key: ContextVar[str] = ContextVar("_current_session_key", default="default")
@@ -520,6 +531,60 @@ def run_analysis_tool(period: str) -> dict[str, Any]:
             return {"error": str(exc), "interfaceSummary": None}
 
 
+def _select_grounding(body: dict, min_score: float) -> dict[str, Any]:
+    """Pick the best-matching catalog document from a grounding response. Pure.
+
+    Vector retrieval ALWAYS returns nearest neighbours, even for a query with no
+    real catalog entry — so "a document came back" is NOT a match. We score each
+    document by its highest chunk similarity (searchScores.aggregatedScore.value),
+    take the top document, and only treat it as a match when that best score
+    clears `min_score`. groundingText is built from that ONE document's chunks,
+    ordered best-first — never a concatenation across unrelated documents.
+
+    Returns {match: bool, bestScore: float, groundingText?, groundingSource?}.
+    """
+    def _chunk_score(ch: dict) -> float:
+        try:
+            v = ch["searchScores"]["aggregatedScore"]["value"]
+            return float(v)
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
+    def _meta(items: list) -> dict:
+        return {m["key"]: m["value"][0] for m in items if m.get("value")}
+
+    try:
+        docs = body["results"][0]["results"][0]["dataRepository"]["documents"]
+    except (KeyError, IndexError, TypeError):
+        docs = []
+    if not docs:
+        return {"match": False, "bestScore": 0.0}
+
+    # Best document = the one whose strongest chunk scores highest.
+    def _doc_best(doc: dict) -> float:
+        return max((_chunk_score(c) for c in doc.get("chunks", [])), default=0.0)
+
+    top_doc = max(docs, key=_doc_best)
+    best = _doc_best(top_doc)
+    if best < min_score:
+        return {"match": False, "bestScore": best}
+
+    # Emit only the matched document's chunks, ordered best-first.
+    scored = sorted(top_doc.get("chunks", []), key=_chunk_score, reverse=True)
+    grounding_text = "\n\n".join(c.get("content", "") for c in scored if c.get("content"))
+    meta = _meta(top_doc.get("metadata", []))
+    return {
+        "match": True,
+        "bestScore": best,
+        "groundingText": grounding_text,
+        "groundingSource": {
+            "title": meta.get("title", ""),
+            "filePath": meta.get("filePath", ""),
+            "webUrl": meta.get("webUrl", ""),
+        },
+    }
+
+
 @tool
 def run_doc_error_catalog_tool(query: str) -> dict[str, Any]:
     """Retrieve root cause and resolution steps for an AIF error from the SharePoint document catalog.
@@ -570,30 +635,17 @@ def run_doc_error_catalog_tool(query: str) -> dict[str, Any]:
                 resp.raise_for_status()
                 body = resp.json()
 
-            try:
-                doc = body["results"][0]["results"][0]["dataRepository"]["documents"][0]
-                chunks = doc.get("chunks", [])
-            except (KeyError, IndexError):
+            selected = _select_grounding(body, AICORE_GROUNDING_MIN_SCORE)
+            span.set_attribute("grounding.best_score", selected.get("bestScore", 0.0))
+            span.set_attribute("grounding.min_score", AICORE_GROUNDING_MIN_SCORE)
+            if not selected.get("match"):
+                # A weak nearest-neighbour is NOT a match — returning it would
+                # present an unrelated error's resolution as the answer.
                 span.set_attribute("outcome", "no_match")
-                return {"match": False}
-
-            def _meta(items: list) -> dict:
-                return {m["key"]: m["value"][0] for m in items if m.get("value")}
-
-            doc_meta = _meta(doc.get("metadata", []))
-            grounding_text = "\n\n".join(c.get("content", "") for c in chunks)
-            title = doc_meta.get("title", "")
+                return {"match": False, "bestScore": selected.get("bestScore", 0.0)}
             span.set_attribute("outcome", "success")
-            span.set_attribute("grounding.document_title", title)
-            return {
-                "match": True,
-                "groundingText": grounding_text,
-                "groundingSource": {
-                    "title": title,
-                    "filePath": doc_meta.get("filePath", ""),
-                    "webUrl": doc_meta.get("webUrl", ""),
-                },
-            }
+            span.set_attribute("grounding.document_title", selected["groundingSource"]["title"])
+            return selected
         except Exception as exc:
             logger.exception("run_doc_error_catalog_tool failed")
             span.set_attribute("outcome", "error")
