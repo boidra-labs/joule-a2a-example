@@ -78,6 +78,25 @@ AICORE_GROUNDING_REPOSITORY = os.environ.get(
 # wrongly rejected).
 AICORE_GROUNDING_MIN_SCORE = float(os.environ.get("AICORE_GROUNDING_MIN_SCORE", "0.45"))
 
+# Grounding backend for run_doc_error_catalog_tool:
+#   "retrieval"     -> direct document-grounding retrieval/search + a relevance
+#                      score gate (precise; rejects weak nearest-neighbour hits).
+#   "orchestration" -> AI Core Orchestration /completion (retrieve -> template ->
+#                      LLM) returning a grounded {root_cause, resolution_step[]}
+#                      JSON. No score gate; relies on the prompt's
+#                      resolvable_from_references self-assessment. Tunable via env.
+GROUNDING_MODE = os.environ.get("GROUNDING_MODE", "retrieval").strip().lower()
+# Full URL of the orchestration deployment's /completion endpoint (required only
+# when GROUNDING_MODE=orchestration). e.g.
+# https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com/v2/inference/deployments/<id>/v2/completion
+GROUNDING_ORCH_URL = os.environ.get("AICORE_ORCH_COMPLETION_URL", "")
+# input_params key names the orchestration template expects (deployment-specific).
+# The AIF deployment fills Error ID / Number / Message separately. Override via
+# env if the deployment uses different names, without a redeploy.
+GROUNDING_ORCH_PARAM_ID = os.environ.get("AICORE_ORCH_PARAM_ID", "error_id")
+GROUNDING_ORCH_PARAM_NUMBER = os.environ.get("AICORE_ORCH_PARAM_NUMBER", "error_number")
+GROUNDING_ORCH_PARAM_MESSAGE = os.environ.get("AICORE_ORCH_PARAM_MESSAGE", "error_message")
+
 # Context var set by stream() so tool functions can read the current user/session key
 # without needing an extra parameter threaded through LangGraph.
 _current_session_key: ContextVar[str] = ContextVar("_current_session_key", default="default")
@@ -535,6 +554,70 @@ def run_analysis_tool(period: str) -> dict[str, Any]:
             return {"error": str(exc), "interfaceSummary": None}
 
 
+def _split_error_query(query: str) -> tuple[str, str, str]:
+    """Split a 'MSGID/MSGNO MSGTX' grounding query into (id, number, text).
+
+    'AIF/099 Processing terminated' -> ('AIF', '099', 'Processing terminated').
+    Tolerant of a missing slash or missing text.
+    """
+    q = (query or "").strip()
+    head, _, text = q.partition(" ")
+    mid, slash, mno = head.partition("/")
+    if not slash:
+        return head, "", text.strip()
+    return mid, mno, text.strip()
+
+
+def _parse_orchestration_grounding(body: dict) -> dict[str, Any]:
+    """Parse an AI Core Orchestration /completion response into a grounding result.
+
+    The grounded answer is a JSON object (sometimes a JSON string) at
+    final_result.choices[0].message.content with keys root_cause,
+    resolution_step[], and optionally resolvable_from_references. The retrieved
+    reference text sits at intermediate_results.grounding.data.grounding_result.
+
+    Returns the same shape the analysis flow consumes:
+    {match, rootCause, resolutionSteps[], groundingText, groundingSource}.
+    No relevance score is available here, so we honour the model's
+    resolvable_from_references self-assessment instead.
+    """
+    try:
+        content = body["final_result"]["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return {"match": False}
+
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return {"match": False}
+    if not isinstance(content, dict):
+        return {"match": False}
+
+    root_cause = (content.get("root_cause") or "").strip()
+    steps = [s for s in (content.get("resolution_step") or []) if s]
+    resolvable = content.get("resolvable_from_references", True)
+    if not root_cause or resolvable is False:
+        return {"match": False}
+
+    grounding_text = ""
+    try:
+        grounding_text = body["intermediate_results"]["grounding"]["data"].get(
+            "grounding_result", ""
+        ) or ""
+    except (KeyError, TypeError):
+        grounding_text = ""
+
+    return {
+        "match": True,
+        "rootCause": root_cause,
+        "resolutionSteps": steps,
+        "groundingText": grounding_text,
+        "groundingSource": {"title": "AI Core Orchestration grounding",
+                            "filePath": "", "webUrl": ""},
+    }
+
+
 def _select_grounding(body: dict, min_score: float) -> dict[str, Any]:
     """Pick the best-matching catalog document from a grounding response. Pure.
 
@@ -591,7 +674,15 @@ def _select_grounding(body: dict, min_score: float) -> dict[str, Any]:
 
 @tool
 def run_doc_error_catalog_tool(query: str) -> dict[str, Any]:
-    """Retrieve root cause and resolution steps for an AIF error from the SharePoint document catalog.
+    """Retrieve root cause and resolution steps for an AIF error from the catalog.
+
+    Two backends, selected by the GROUNDING_MODE env var:
+      - 'retrieval' (default): document-grounding retrieval/search with a
+        relevance score gate; returns groundingText from the best matching doc.
+      - 'orchestration': AI Core Orchestration /completion (retrieve -> LLM)
+        returning a grounded {rootCause, resolutionSteps[]} answer.
+    Either way the result is {match, rootCause?/groundingText?, ...} for the
+    analysis flow to build a resolution entry from.
 
     Args:
         query: Error query string in the form 'MSGID/MSGNO MSGTX'.
@@ -612,6 +703,38 @@ def run_doc_error_catalog_tool(query: str) -> dict[str, Any]:
             )
             token_resp.raise_for_status()
             access_token = token_resp.json()["access_token"]
+            span.set_attribute("grounding.mode", GROUNDING_MODE)
+
+            # --- Orchestration mode: retrieve -> template -> LLM in one call ---
+            # Returns a grounded {root_cause, resolution_step[]} JSON. No chunk
+            # score is available, so relevance relies on the prompt's
+            # resolvable_from_references self-assessment (parsed in
+            # _parse_orchestration_grounding).
+            if GROUNDING_MODE == "orchestration":
+                if not GROUNDING_ORCH_URL:
+                    span.set_attribute("outcome", "misconfigured")
+                    return {"error": "AICORE_ORCH_COMPLETION_URL not configured", "match": False}
+                err_id, err_no, err_msg = _split_error_query(query)
+                orch_payload = {"input_params": {
+                    GROUNDING_ORCH_PARAM_ID: err_id,
+                    GROUNDING_ORCH_PARAM_NUMBER: err_no,
+                    GROUNDING_ORCH_PARAM_MESSAGE: err_msg,
+                }}
+                with httpx.Client(timeout=60) as client:
+                    resp = client.post(
+                        GROUNDING_ORCH_URL,
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/json",
+                            "AI-Resource-Group": "resource",
+                            "Authorization": f"Bearer {access_token}",
+                        },
+                        json=orch_payload,
+                    )
+                    resp.raise_for_status()
+                    parsed = _parse_orchestration_grounding(resp.json())
+                span.set_attribute("outcome", "success" if parsed.get("match") else "no_match")
+                return parsed
 
             payload = {
                 "query": query,

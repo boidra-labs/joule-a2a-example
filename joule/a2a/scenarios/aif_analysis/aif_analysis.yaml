@@ -26,6 +26,10 @@ capability_context:
   - name: agent_state
     value: $target_result.agent_state
 
+response_context:
+  - value: $target_result.agentResponse
+    description: The AIF monitoring analysis answer in Markdown.
+
 
 
 

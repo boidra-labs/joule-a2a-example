@@ -42,12 +42,12 @@ action_groups:
           - name: _markdown
             value: "<? _agent_response.body.artifacts[0].parts[1].data.message ?>"
 
-  - actions:
-      - type: message
-        message:
-          type: text
-          content: "<? _markdown ?>"
-          markdown: true
+  # - actions:
+  #     - type: message
+  #       message:
+  #         type: text
+  #         content: "<? _markdown ?>"
+  #         markdown: true
 
 result:
   agent_context_id: <? _context_id ?>
