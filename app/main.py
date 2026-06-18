@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # CRITICAL: Initialize telemetry and AI Core BEFORE importing AI frameworks.
-from app.bootstrap import configure_aicore, configure_telemetry  # noqa: E402
+from app.bootstrap import configure_aicore, configure_telemetry, configure_memory  # noqa: E402
 configure_aicore()
 configure_telemetry()
 
@@ -87,7 +87,10 @@ def build_app() -> Starlette:
     )
 
     task_store = InMemoryTaskStore()
-    executor = CodemineAgentExecutor()
+    # Persistent per-context_id memory (history + vector). None if unbound — the
+    # agent then falls back to transient A2A task history only.
+    memory_client = configure_memory()
+    executor = CodemineAgentExecutor(memory_client=memory_client)
     handler = DefaultRequestHandler(
         agent_executor=executor,
         task_store=task_store,

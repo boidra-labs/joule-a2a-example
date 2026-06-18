@@ -107,6 +107,48 @@ _current_session_key: ContextVar[str] = ContextVar("_current_session_key", defau
 # Agent Memory path still persists the full turn text separately when bound.
 _context_findings: dict[str, str] = {}
 
+# ---------------------------------------------------------------------------
+# Short-term conversation memory (in-process, per A2A context_id).
+#
+# Used when the SAP Agent Memory service is not bound: keeps the last
+# _SHORT_TERM_MAX_TURNS (user, assistant) turns per context_id in process so
+# multi-turn conversations retain history. Survives across requests while the
+# app runs; reset on restart, and NOT shared across instances. The SAP Agent
+# Memory path (when a client is bound) takes precedence and persists durably.
+# ---------------------------------------------------------------------------
+from collections import deque  # noqa: E402
+
+_SHORT_TERM_MAX_TURNS = 10
+_short_term_memory: dict[str, deque] = {}
+
+
+def _short_term_remember(context_id: str, query: str, response: str) -> None:
+    """Append a (user, assistant) turn to this context's short-term memory."""
+    if not context_id:
+        return
+    dq = _short_term_memory.get(context_id)
+    if dq is None:
+        dq = deque(maxlen=_SHORT_TERM_MAX_TURNS)
+        _short_term_memory[context_id] = dq
+    dq.append({"user": query, "assistant": response})
+
+
+def _short_term_history(context_id: str) -> list:
+    """Return this context's short-term turns as LangChain messages (oldest first)."""
+    out: list = []
+    for turn in _short_term_memory.get(context_id, ()):  # type: ignore[arg-type]
+        out.append(HumanMessage(content=turn["user"]))
+        out.append(AIMessage(content=turn["assistant"]))
+    return out
+
+
+def _short_term_clear(context_id: str | None = None) -> None:
+    """Clear one context's short-term memory, or all of it (for tests)."""
+    if context_id is None:
+        _short_term_memory.clear()
+    else:
+        _short_term_memory.pop(context_id, None)
+
 
 def _findings_from_card(data: dict | None) -> str:
     """Build a short reference of the PREVIOUS answer (errors with GUIDs, and
@@ -1666,6 +1708,46 @@ def _search_relevant_memories(memory_client, context_id: str, query: str) -> str
         return ""
 
 
+def _assemble_history(memory_client, context_id: str, a2a_history, query: str) -> list:
+    """Build the prior-turns context for a request, scoped to context_id.
+
+    ALWAYS does two lookups (the previous code only vector-searched as a
+    fallback, so semantic recall never fired in multi-turn sessions):
+      1. message history for this context_id (persistent memory, else the
+         transient A2A task history),
+      2. a vector/semantic search of this context's past memories for content
+         relevant to the current query.
+    Both are returned together (vector hits as a leading SystemMessage), so the
+    model can always check historical data per context.
+    """
+    history = _load_history(memory_client, context_id)
+
+    # No persistent memory? Use this context's in-process short-term history.
+    if not history:
+        history = _short_term_history(context_id)
+
+    # Last resort: the transient A2A task history (single task).
+    if not history and a2a_history:
+        try:
+            from a2a.types.a2a_pb2 import Role
+            for entry in a2a_history:
+                if entry["role"] == Role.ROLE_USER:
+                    history.append(HumanMessage(content=entry["text"]))
+                elif entry["role"] == Role.ROLE_AGENT:
+                    history.append(AIMessage(content=entry["text"]))
+        except Exception:
+            logger.warning("Failed to map A2A history")
+
+    # ALWAYS vector-search this context's memories for the current query.
+    memory_context = _search_relevant_memories(memory_client, context_id, query)
+
+    assembled: list = []
+    if memory_context:
+        assembled.append(SystemMessage(content=memory_context))
+    assembled.extend(history)
+    return assembled
+
+
 # ---------------------------------------------------------------------------
 # Agent graph
 # ---------------------------------------------------------------------------
@@ -1811,21 +1893,9 @@ class CodemineAgent:
                 session_key = user_id if user_id else "default"
                 _current_session_key.set(session_key)
 
-                history = _load_history(self.memory, context_id)
-
-                if not history:
-                    # Fall back to A2A task history (available without memory client)
-                    if a2a_history:
-                        from a2a.types.a2a_pb2 import Role
-                        for entry in a2a_history:
-                            if entry["role"] == Role.ROLE_USER:
-                                history.append(HumanMessage(content=entry["text"]))
-                            elif entry["role"] == Role.ROLE_AGENT:
-                                history.append(AIMessage(content=entry["text"]))
-                    else:
-                        memory_context = _search_relevant_memories(self.memory, context_id, query)
-                        if memory_context:
-                            history = [SystemMessage(content=memory_context)]
+                # Always check per-context_id historical data: message history
+                # AND a semantic/vector lookup of this context's past memories.
+                history = _assemble_history(self.memory, context_id, a2a_history, query)
 
                 # Inject the previous turn's GUID-addressable findings (per context_id)
                 # as an assistant message, so "fix that error" can resolve the GUID
@@ -1849,6 +1919,9 @@ class CodemineAgent:
                 # The text part stays the human-readable answer; the structured
                 # { message, intent, data } object rides along as the `data` part.
                 _persist_turn(self.memory, context_id, query, response)
+                # Always record the turn in in-process short-term memory too, so
+                # follow-ups have history even when no Agent Memory service is bound.
+                _short_term_remember(context_id, query, response)
                 card = await self._finalize_structured(result["messages"], response)
                 # Remember this turn's GUID-addressable findings for the next turn
                 # in the same conversation (so "fix that error" finds the GUID).

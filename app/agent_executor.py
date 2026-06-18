@@ -28,8 +28,8 @@ def _data_part(data: dict) -> Part:
 
 
 class CodemineAgentExecutor(AgentExecutor):
-    def __init__(self) -> None:
-        self.agent = CodemineAgent(memory_client=None)
+    def __init__(self, memory_client=None) -> None:
+        self.agent = CodemineAgent(memory_client=memory_client)
 
     async def execute(
         self, context: RequestContext, event_queue: EventQueue

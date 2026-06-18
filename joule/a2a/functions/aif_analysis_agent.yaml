@@ -53,4 +53,3 @@ result:
   agent_context_id: <? _context_id ?>
   agent_task_id: <? _task_id ?>
   agent_state: <? _state ?>
-  agentResponse: <? _markdown ?>
