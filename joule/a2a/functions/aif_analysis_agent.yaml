@@ -16,10 +16,10 @@ action_groups:
       - type: agent-request
         agent_type: remote
         system_alias: AIF_ANALYSIS_AGENT
-        body: >
+        body: 
           {
-            contextId: <? agent_context_id ?>, 
-            taskId: <? agent_task_id ?>, 
+            contextId: '<? agent_context_id ?>',
+            taskId: '<? agent_task_id ?>',
             configurations:
             {           
             pushNotifications: true 
@@ -53,3 +53,4 @@ result:
   agent_context_id: <? _context_id ?>
   agent_task_id: <? _task_id ?>
   agent_state: <? _state ?>
+

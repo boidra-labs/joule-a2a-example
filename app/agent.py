@@ -495,6 +495,13 @@ when several genuinely match. Never invent a GUID or interface.
     (no value), report which interfaces carry it (from get_key_fields_tool).
 25. A plain GUID READ ("show/look up message <GUID>") -> get_message_log_tool(guid).
     This is message_detail, NOT a resolution.
+28. PAYLOAD/DATA of a message ("show the payload of message <GUID>", "what data /
+    fields / content did that message carry", "show the shipment data") ->
+    get_payload_data_tool(guid). It returns a business-readable Markdown `report`
+    (Header as a field table, line items as a row-per-entry table). Return that
+    `report` VERBATIM — do not reformat or summarise it. If the user refers to a
+    message without a GUID ("show its payload", "the data for that one"), resolve
+    the GUID from the "KNOWN ERRORS FROM THE PREVIOUS ANSWER" block like rule 26.
 26. "fix/resolve/triage message <GUID>" -> get_message_log_tool(guid) to get every
     error (MsgType='E'); for EACH error call run_doc_error_catalog_tool with
     'MSGID/MSGNO Text'; ground rootCause + resolutionSteps verbatim from
@@ -544,6 +551,7 @@ Pick `intent` from what the user asked for and which tools ran:
 - message_detail — a GUID read. data = { messageGuid, interface, logCount, logEntries:[{msgType, msgId, msgNo, text}] }.
 - business_key — a business object (customer, vendor, cost center, PO…). data = { mode:'interfaces'|'messages', count, interfaces:[...] or messages:[...] }.
 - resolution — "fix/resolve message <GUID>". data = { messageGuid, interface, errorCount, summary, errors:[{msgId, msgNo, messageText, rootCause, resolutionSteps[], restartSafe, grounded, sourceText}] }. sourceText is ALWAYS set: '[title](webUrl)' when a doc matched, else 'SAP standard documentation for <msgId>/<msgNo>'.
+- payload — a message's payload/data view. Set intent='payload' and leave `data` null. (The Markdown payload report from get_payload_data_tool is the assistant draft; it is copied into `message` verbatim by the agent — do NOT rewrite it.)
 - analysis — a full monitoring report / overview. Set intent='analysis' and leave `data` null. (The full Markdown report from build_analysis_report_tool is the assistant draft; it is copied into `message` verbatim by the agent — do NOT rewrite, shorten, or relocate it.)
 
 STRICT GROUNDING: copy values ONLY from the tool results and the assistant draft. Never invent interfaces, counts, error codes, root causes, or resolution steps. If a field is unknown use "—" (text) or 0 (number). Except for analysis (handled above), `message` is a concise Markdown fallback of the same content."""
@@ -1606,6 +1614,228 @@ def get_message_log_tool(msgguid: str) -> dict[str, Any]:
         return {"messageGuid": msgguid, "interface": interface, "logEntries": entries, "logCount": len(entries)}
 
 
+# ---------------------------------------------------------------------------
+# Payload structure -> business-readable Markdown (deterministic, testable)
+# ---------------------------------------------------------------------------
+
+_PAYLOAD_VALUE_KEYS = ("Fieldvalue", "FieldValue", "Value", "RawValue")
+_PAYLOAD_EMPTY = "_(empty)_"
+
+
+def _payload_to_markdown(values: Any, definition: Any = None,
+                         interface: str | None = None,
+                         value_field: str | None = None) -> str:
+    """Render AIF payload values as business-readable Markdown. Values-first.
+
+    Consumes PayloadFieldvalueSet rows (Path + Fieldvalue, leaves only — ancestor
+    group nodes are synthesized). Per message: single-record groups (Header) ->
+    vertical "Field | Value" table; arrays (Items) -> one row per entry. Fields are
+    ordered by GlobalRowNumber; the leaf with GlobalRowNumber==1 is the document
+    key in the heading. `definition` (PayloadStructureSet) is optional and surfaces
+    fields that are empty in this message. Output is ASCII (for SAP Joule).
+    """
+    import re as _re
+    from collections import OrderedDict
+
+    def _rows(src):
+        if isinstance(src, dict):
+            return src.get("value", []) or [], src.get("@odata.nextLink")
+        return (src or []), None
+
+    def _value_key(rows):
+        for r in rows:
+            for k in _PAYLOAD_VALUE_KEYS:
+                if k in r:
+                    return k
+        return None
+
+    def leaf(p): return p.rstrip("/").rsplit("/", 1)[-1]
+    def parent(p): return p.rsplit("/", 1)[0] or "/"
+    def is_idx(n): return bool(_re.fullmatch(r"\d+", n))
+    def norm(p): return _re.sub(r"/\d+(?=/|$)", "/*", p)   # /Items/1/X -> /Items/*/X
+
+    def schema_from_def(defsrc):
+        rows, _ = _rows(defsrc)
+        by_if: dict = {}
+        for r in rows:
+            by_if.setdefault(r.get("InterfaceName"), []).append(r["Path"])
+        schema = {}
+        for iface_, paths in by_if.items():
+            pset = set(paths)
+            leaves = [p for p in paths if not any(q != p and q.startswith(p + "/") for q in pset)]
+            schema[iface_] = {norm(p) for p in leaves}
+        return schema
+
+    def build(rows, vkey):
+        by_path, kids, vals, grn = {}, {}, {}, {}
+        seen = set()
+
+        def register(child):
+            par = parent(child)
+            if (par, child) not in seen:
+                kids.setdefault(par, []).append(child)
+                seen.add((par, child))
+
+        for r in rows:
+            p = r["Path"]
+            by_path[p] = r
+            vals[p] = r.get(vkey, "") if vkey else ""
+            try:
+                grn[p] = int(r.get("GlobalRowNumber"))
+            except (TypeError, ValueError):
+                grn[p] = 10 ** 9
+            cur = p
+            while cur.count("/") >= 1:
+                register(cur)
+                par = parent(cur)
+                if par in ("", "/"):
+                    break
+                by_path.setdefault(par, {})
+                cur = par
+        for node in list(by_path):                 # group grn = min of descendants
+            if grn.get(node, 10 ** 9) == 10 ** 9:
+                desc = [grn[k] for k in grn if k.startswith(node + "/")]
+                grn[node] = min(desc) if desc else 10 ** 9
+        return by_path, kids, vals, grn
+
+    def is_array(path, by_path, kids):
+        if by_path.get(path, {}).get("IsTable"):
+            return True
+        ch = kids.get(path, [])
+        return bool(ch) and all(is_idx(leaf(c)) for c in ch)
+
+    def order(paths, grn):
+        return sorted(paths, key=lambda p: (grn.get(p, 10 ** 9), leaf(p)))
+
+    def fields(par, by_path, kids, vals, grn):
+        out = []
+        for c in order(kids.get(par, []), grn):
+            if kids.get(c) and not is_array(c, by_path, kids):
+                for lbl, val, g in fields(c, by_path, kids, vals, grn):
+                    out.append((leaf(c) + " / " + lbl, val, g))
+            else:
+                out.append((leaf(c), vals.get(c, ""), grn.get(c, 10 ** 9)))
+        return out
+
+    def vtable(rows):
+        md = ["| Field | Value |", "|---|---|"]
+        for lbl, val, _ in rows:
+            md.append(f"| {lbl} | {val if val != '' else _PAYLOAD_EMPTY} |")
+        return md
+
+    def atable(instances, by_path, kids, vals, grn, extra_cols=()):
+        per, cols = [], []
+        for inst in instances:
+            fr = fields(inst, by_path, kids, vals, grn)
+            per.append((leaf(inst), {l: v for l, v, _ in fr}))
+            for l, _, g in fr:
+                if l not in [c for c, _ in cols]:
+                    cols.append((l, g))
+        for c in extra_cols:
+            if c not in [x for x, _ in cols]:
+                cols.append((c, 10 ** 9))
+        cols = [c for c, _ in sorted(cols, key=lambda x: (x[1], x[0]))]
+        md = ["| # | " + " | ".join(cols) + " |",
+              "|---|" + "|".join(["---"] * len(cols)) + "|"]
+        for idx, d in per:
+            md.append(f"| {idx} | " + " | ".join((d.get(c, "") or _PAYLOAD_EMPTY) for c in cols) + " |")
+        return md
+
+    def message_md(rows, vkey, schema):
+        by_path, kids, vals, grn = build(rows, vkey)
+        roots = sorted(p for p in by_path if parent(p) not in by_path)
+        iface_ = rows[0].get("InterfaceName", "")
+        key_lbl = key_val = None
+        for r in rows:
+            if str(r.get("GlobalRowNumber")) == "1":
+                key_lbl, key_val = leaf(r["Path"]), r.get(vkey, "")
+                break
+        out = [f"### {key_lbl} = {key_val}" if key_lbl else f"### {rows[0].get('MessageGuid', '')}", ""]
+        iface_schema = (schema or {}).get(iface_, set())
+        for root in roots:
+            for child in order(kids.get(root, []), grn):
+                title = leaf(child)
+                if is_array(child, by_path, kids):
+                    insts = sorted(kids.get(child, []), key=lambda x: int(leaf(x)))
+                    miss = [norm(s).rsplit("/", 1)[-1] for s in iface_schema
+                            if norm(child) + "/*/" in (norm(s) + "/")]
+                    out.append(f"**{title}** ({len(insts)} entries)")
+                    out.append("")
+                    out += atable(insts, by_path, kids, vals, grn, extra_cols=miss)
+                    out.append("")
+                else:
+                    out.append(f"**{title}**")
+                    out.append("")
+                    rowsf = fields(child, by_path, kids, vals, grn)
+                    present = {l for l, _, _ in rowsf}
+                    for s in sorted(iface_schema):
+                        nb = norm(child)
+                        if s.startswith(nb + "/") and "/*/" not in s[len(nb):]:
+                            lf = s.rsplit("/", 1)[-1]
+                            if lf not in present:
+                                rowsf.append((lf, "", 10 ** 9))
+                    out += vtable(rowsf)
+                    out.append("")
+        return "\n".join(out)
+
+    rows, nextlink = _rows(values)
+    if not rows:
+        return _ascii("# SAP AIF Payload\n\n> No payload data available for this message.\n")
+    vkey = value_field or _value_key(rows)
+    schema = schema_from_def(definition) if definition else None
+    if interface:
+        rows = [r for r in rows if r.get("InterfaceName") == interface]
+
+    by_if: "OrderedDict" = OrderedDict()
+    for r in rows:
+        by_if.setdefault(r.get("InterfaceName", ""), OrderedDict()) \
+             .setdefault(r.get("MessageGuid", ""), []).append(r)
+
+    out = ["# SAP AIF Payload"]
+    if nextlink:
+        out += ["", "> Note: response is paginated; this view covers the current page only."]
+    for iface_, msgs in by_if.items():
+        out += ["", f"## Interface: {iface_}  ({len(msgs)} message{'s' if len(msgs) != 1 else ''})", ""]
+        for guid, mrows in msgs.items():
+            out.append(message_md(mrows, vkey, schema))
+    return _ascii("\n".join(out).rstrip() + "\n")
+
+
+@tool
+def get_payload_data_tool(msgguid: str) -> dict[str, Any]:
+    """Read an AIF message's PAYLOAD data structure and render it for business users.
+
+    Use when the user asks to see the payload, data, content, or field values of a
+    specific message (by 32-char GUID) — e.g. "show the payload of message <GUID>",
+    "what data did that shipment carry". Reads the field VALUES from
+    PayloadFieldvalueSet and (optionally) the field DEFINITION from
+    PayloadStructureSet, and returns a business-readable Markdown `report` (Header
+    as a field table, line items as a row-per-entry table). Return it VERBATIM.
+
+    Args:
+        msgguid: The 32-char AIF message GUID.
+    """
+    with tracer.start_as_current_span("get_payload_data_tool", attributes={"aif.msgguid": msgguid}) as span:
+        flt = {"$filter": f"MessageGuid eq '{msgguid}'"}
+        # Values-first: the field values drive the render.
+        value_rows, err = _aif_get("PayloadFieldvalueSet", flt)
+        if err:
+            span.set_attribute("outcome", "error")
+            return {"error": err, "messageGuid": msgguid, "report": ""}
+        # Optional definition surfaces fields that are empty for this message.
+        def_rows, _derr = _aif_get("PayloadStructureSet", flt)
+        span.set_attribute("outcome", "success")
+        span.set_attribute("aif.payload_value_count", len(value_rows))
+        span.set_attribute("aif.payload_node_count", len(def_rows or []))
+        return {
+            "messageGuid": msgguid,
+            "valueCount": len(value_rows),
+            "nodeCount": len(def_rows or []),
+            "report": _payload_to_markdown({"value": value_rows},
+                                           definition={"value": def_rows or []}),
+        }
+
+
 @tool
 def get_agent_capabilities_tool(agent: str = "self") -> dict[str, Any]:
     """Fetch THIS agent's card (capabilities, skills, example queries).
@@ -1768,6 +1998,7 @@ TOOLS = [
     get_key_fields_tool,
     find_messages_by_key_value_tool,
     get_message_log_tool,
+    get_payload_data_tool,
     build_analysis_report_tool,
 ]
 
