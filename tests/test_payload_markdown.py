@@ -42,9 +42,20 @@ def test_items_array_one_row_per_entry():
 
 
 def test_document_key_in_title():
-    # GlobalRowNumber == 1 is the document key -> appears in a heading.
+    # GlobalRowNumber == 1 is the document key -> appears in the (single) heading.
     md = _payload_to_markdown(_VALUES)
-    assert "ShipmentNumber = 0000123456" in md
+    assert "ShipmentNumber 0000123456" in md
+
+
+def test_no_heavy_header_for_single_message():
+    # The bulky "# SAP AIF Payload" + "## Interface: X (1 message)" lines are gone;
+    # one compact title combines interface + document key instead.
+    md = _payload_to_markdown(_VALUES)
+    assert "# SAP AIF Payload" not in md
+    assert "## Interface:" not in md
+    assert "(1 message)" not in md
+    # compact heading present
+    assert "SHIPMENT" in md and md.lstrip().startswith("#")
 
 
 def test_field_order_follows_global_row_number():

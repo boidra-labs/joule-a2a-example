@@ -67,6 +67,17 @@ AICORE_GROUNDING_REPOSITORY = os.environ.get(
     "AICORE_GROUNDING_REPOSITORY", "a7554f34-629a-4433-8548-8c736ffbef55"
 )
 
+# SAP Help grounding for general AIF concept/explanation questions. Defaults to
+# the public help.sap.com data-repository type (no fixed repo id needed); a
+# specific repo can be pinned via env. The AIF cookbook is the canonical source
+# link and the fallback when grounding returns nothing relevant.
+AIF_HELP_REPOSITORY = os.environ.get("AICORE_AIF_HELP_REPOSITORY", "*")
+AIF_HELP_REPOSITORY_TYPE = os.environ.get("AICORE_AIF_HELP_REPOSITORY_TYPE", "help.sap.com")
+AIF_COOKBOOK_URL = os.environ.get(
+    "AIF_COOKBOOK_URL",
+    "https://help.sap.com/docs/SUPPORT_CONTENT/abapconn/3354079452.html",
+)
+
 # Minimum vector-similarity score (chunk aggregatedScore, 0..1) for a grounding
 # hit to count as a real match. Below this the retriever only returned weak
 # nearest-neighbours (no catalog entry for the error) and we must NOT present
@@ -363,6 +374,21 @@ def _v4_dt(value: str, is_end: bool = False) -> str:
 
 SYSTEM_PROMPT = """You are an expert SAP AIF (Application Interface Framework) interface monitoring analyst for Central Finance.
 
+SCOPE — you ONLY help with SAP AIF interface monitoring: interfaces, error
+worklists, statistics/health, message details, message payload/data, error
+resolutions, and AIF concepts/terminology. You MAY also answer questions about
+data you fetched earlier in THIS conversation (recall from memory), and explain
+AIF concepts using SAP Help / the AIF cookbook (get_aif_help_tool).
+If the user asks anything OUTSIDE this scope (general chit-chat, other SAP
+modules, coding help, world knowledge, etc.), do NOT use tools and do NOT
+attempt an answer — reply with exactly one short line:
+"I can only help with SAP AIF interface monitoring — interfaces, errors,
+statistics, message data, and resolutions. What would you like to check?"
+For AIF concept/explanation questions (e.g. "what is a namespace", "what does
+status 'in process' mean", or a follow-up like "what does TotalWeight mean
+here") call get_aif_help_tool and answer from its grounded helpText, citing its
+`source` (the AIF cookbook when nothing more specific matched).
+
 Your tools:
 - calculate_date_range_tool: resolve a free-text period ('2025', 'last week', a range) into from/to DateTimeOffset bounds. Call FIRST for any time-bounded request.
 - list_interfaces_tool: list interfaces available for monitoring (+ searchable key-field labels).
@@ -372,6 +398,8 @@ Your tools:
 - find_messages_by_key_value_tool: find messages by a business-key FieldName + FieldValue.
 - get_message_log_tool: read the ERROR log entries (MsgType='E') of one message by GUID.
 - run_doc_error_catalog_tool: retrieves root cause and resolution steps for a specific error code from the SharePoint document catalog.
+- get_payload_data_tool: read a message's payload/data by GUID and render it as a business-readable Markdown report.
+- get_aif_help_tool: explain an AIF concept/term grounded in SAP Help / the AIF cookbook.
 - get_interface_details_tool: returns a structured explanation of a SAP AIF interface given its namespace, name, and version.
 
 Rules for AIF analysis (rules 1-10) — the full monitoring report (intent=analysis):
@@ -530,6 +558,24 @@ Errors" list (ranked by occurrences, with criticality); and an "Error Resolution
 is plain ASCII Markdown tables/text only — no charts, no emoji/icons — so SAP Joule renders
 it cleanly. You never hand-build these sections — you only feed the tool the statistics,
 error rows, grounded resolutions, and interface catalog, then return its output unchanged.
+
+Rule 29 — FOLLOW-UP SUGGESTION. After a CONVERSATIONAL result (worklist/errors,
+statistics/health, message_detail, business_key, resolution), end your message with
+ONE short italic question line suggesting the most useful next step, tailored to what
+you just showed:
+  - worklist / errors for a period or interface ->
+    "_Would you like to see the payload or a resolution for one of these messages?_"
+  - statistics / health ->
+    "_Would you like a full analysis for this period, or to drill into one interface?_"
+  - message_detail (a GUID read) ->
+    "_Would you like to see this message's payload or how to fix it?_"
+  - business_key ->
+    "_Would you like the error worklist or statistics for one of these interfaces?_"
+  - resolution ->
+    "_Would you like to see the payload of this message to verify the data?_"
+Exactly one line, plain ASCII, on its own line at the very end. Do NOT add a follow-up
+to the analysis report or the payload view (those are returned verbatim and must not be
+modified). Do NOT stack multiple questions or a bulleted menu.
 """
 
 
@@ -554,7 +600,7 @@ Pick `intent` from what the user asked for and which tools ran:
 - payload — a message's payload/data view. Set intent='payload' and leave `data` null. (The Markdown payload report from get_payload_data_tool is the assistant draft; it is copied into `message` verbatim by the agent — do NOT rewrite it.)
 - analysis — a full monitoring report / overview. Set intent='analysis' and leave `data` null. (The full Markdown report from build_analysis_report_tool is the assistant draft; it is copied into `message` verbatim by the agent — do NOT rewrite, shorten, or relocate it.)
 
-STRICT GROUNDING: copy values ONLY from the tool results and the assistant draft. Never invent interfaces, counts, error codes, root causes, or resolution steps. If a field is unknown use "—" (text) or 0 (number). Except for analysis (handled above), `message` is a concise Markdown fallback of the same content."""
+STRICT GROUNDING: copy values ONLY from the tool results and the assistant draft. Never invent interfaces, counts, error codes, root causes, or resolution steps. If a field is unknown use "—" (text) or 0 (number). Except for analysis (handled above), `message` is a concise Markdown fallback of the same content. If the assistant draft ends with a single italic follow-up question line (e.g. "_Would you like to see the payload...?_"), KEEP it as the last line of `message`."""
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +847,112 @@ def _select_grounding(body: dict, min_score: float) -> dict[str, Any]:
             "webUrl": meta.get("webUrl", ""),
         },
     }
+
+
+def _select_help_grounding(body: dict, min_score: float) -> dict[str, Any]:
+    """Pick the best SAP Help passage for an AIF concept question. Pure.
+
+    Mirrors _select_grounding but returns help text + a source link, and always
+    falls back to the AIF cookbook URL as the source when nothing relevant is
+    found (so the agent can still cite the cookbook). {match, helpText?, source}.
+    """
+    def _chunk_score(ch: dict) -> float:
+        try:
+            return float(ch["searchScores"]["aggregatedScore"]["value"])
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
+    def _meta(items: list) -> dict:
+        return {m["key"]: m["value"][0] for m in items if m.get("value")}
+
+    try:
+        docs = body["results"][0]["results"][0]["dataRepository"]["documents"]
+    except (KeyError, IndexError, TypeError):
+        docs = []
+    if not docs:
+        return {"match": False, "source": AIF_COOKBOOK_URL}
+
+    top_doc = max(docs, key=lambda d: max((_chunk_score(c) for c in d.get("chunks", [])), default=0.0))
+    best = max((_chunk_score(c) for c in top_doc.get("chunks", [])), default=0.0)
+    if best < min_score:
+        return {"match": False, "bestScore": best, "source": AIF_COOKBOOK_URL}
+
+    scored = sorted(top_doc.get("chunks", []), key=_chunk_score, reverse=True)
+    help_text = "\n\n".join(c.get("content", "") for c in scored if c.get("content"))
+    meta = _meta(top_doc.get("metadata", []))
+    return {
+        "match": True,
+        "bestScore": best,
+        "helpText": help_text,
+        "source": meta.get("webUrl") or AIF_COOKBOOK_URL,
+        "title": meta.get("title", ""),
+    }
+
+
+@tool
+def get_aif_help_tool(question: str) -> dict[str, Any]:
+    """Look up SAP Help / the AIF cookbook to explain an AIF concept or term.
+
+    Use for AIF knowledge questions (NOT data lookups) — e.g. "what is an AIF
+    namespace", "what does status 'in process' mean", "explain this interface
+    error in general", or a follow-up explanation about data already shown
+    ("what does TotalWeight represent here"). Returns grounded `helpText` from SAP
+    Help plus a `source` link (the AIF cookbook when nothing more specific matches).
+    Compose the answer from helpText; cite `source`. Never invent SAP specifics.
+
+    Args:
+        question: the user's AIF concept/explanation question.
+    """
+    with tracer.start_as_current_span("get_aif_help_tool", attributes={"grounding.query": question}) as span:
+        try:
+            aicore_url = os.environ.get("AICORE_BASE_URL", "")
+            if not aicore_url:
+                span.set_attribute("outcome", "misconfigured")
+                return {"match": False, "source": AIF_COOKBOOK_URL,
+                        "note": "SAP Help grounding not configured; cite the AIF cookbook."}
+            auth_url = os.environ.get("AICORE_AUTH_URL", "").rstrip("/") + "/oauth/token"
+            token_resp = httpx.post(
+                auth_url,
+                data={"grant_type": "client_credentials"},
+                auth=(os.environ.get("AICORE_CLIENT_ID", ""), os.environ.get("AICORE_CLIENT_SECRET", "")),
+                timeout=10,
+            )
+            token_resp.raise_for_status()
+            access_token = token_resp.json()["access_token"]
+            payload = {
+                "query": question,
+                "filters": [{
+                    "id": "flt1",
+                    "searchConfiguration": {"maxChunkCount": 20},
+                    "dataRepositories": [AIF_HELP_REPOSITORY],
+                    "dataRepositoryType": AIF_HELP_REPOSITORY_TYPE,
+                    "dataRepositoryMetadata": [],
+                    "documentMetadata": [],
+                    "chunkMetadata": [],
+                }],
+            }
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(
+                    f"{aicore_url.rstrip('/')}/lm/document-grounding/retrieval/search",
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "AI-Resource-Group": "resource",
+                        "Authorization": f"Bearer {access_token}",
+                    },
+                    json=payload,
+                )
+                resp.raise_for_status()
+                body = resp.json()
+            selected = _select_help_grounding(body, AICORE_GROUNDING_MIN_SCORE)
+            span.set_attribute("grounding.best_score", selected.get("bestScore", 0.0))
+            span.set_attribute("outcome", "success" if selected.get("match") else "no_match")
+            return selected
+        except Exception as exc:
+            logger.exception("get_aif_help_tool failed")
+            span.set_attribute("outcome", "error")
+            # Degrade gracefully: the agent can still point at the cookbook.
+            return {"match": False, "source": AIF_COOKBOOK_URL, "error": str(exc)}
 
 
 @tool
@@ -1741,7 +1893,7 @@ def _payload_to_markdown(values: Any, definition: Any = None,
             md.append(f"| {idx} | " + " | ".join((d.get(c, "") or _PAYLOAD_EMPTY) for c in cols) + " |")
         return md
 
-    def message_md(rows, vkey, schema):
+    def message_md(rows, vkey, schema, heading_level="##"):
         by_path, kids, vals, grn = build(rows, vkey)
         roots = sorted(p for p in by_path if parent(p) not in by_path)
         iface_ = rows[0].get("InterfaceName", "")
@@ -1750,7 +1902,12 @@ def _payload_to_markdown(values: Any, definition: Any = None,
             if str(r.get("GlobalRowNumber")) == "1":
                 key_lbl, key_val = leaf(r["Path"]), r.get(vkey, "")
                 break
-        out = [f"### {key_lbl} = {key_val}" if key_lbl else f"### {rows[0].get('MessageGuid', '')}", ""]
+        # One compact title combining interface + document key (no bulky banner).
+        if key_lbl:
+            title = f"{iface_} - {key_lbl} {key_val}" if iface_ else f"{key_lbl} {key_val}"
+        else:
+            title = iface_ or rows[0].get("MessageGuid", "")
+        out = [f"{heading_level} {title}", ""]
         iface_schema = (schema or {}).get(iface_, set())
         for root in roots:
             for child in order(kids.get(root, []), grn):
@@ -1791,13 +1948,18 @@ def _payload_to_markdown(values: Any, definition: Any = None,
         by_if.setdefault(r.get("InterfaceName", ""), OrderedDict()) \
              .setdefault(r.get("MessageGuid", ""), []).append(r)
 
-    out = ["# SAP AIF Payload"]
+    total_msgs = sum(len(m) for m in by_if.values())
+    out: list[str] = []
     if nextlink:
-        out += ["", "> Note: response is paginated; this view covers the current page only."]
+        out += ["> Note: response is paginated; this view covers the current page only.", ""]
     for iface_, msgs in by_if.items():
-        out += ["", f"## Interface: {iface_}  ({len(msgs)} message{'s' if len(msgs) != 1 else ''})", ""]
+        # Only add an interface group header when there are several messages to
+        # group; a single message just gets its own compact title.
+        multi = len(msgs) > 1
+        if multi:
+            out += [f"# {iface_} ({len(msgs)} messages)", ""]
         for guid, mrows in msgs.items():
-            out.append(message_md(mrows, vkey, schema))
+            out.append(message_md(mrows, vkey, schema, heading_level="##" if not multi else "###"))
     return _ascii("\n".join(out).rstrip() + "\n")
 
 
@@ -1999,6 +2161,7 @@ TOOLS = [
     find_messages_by_key_value_tool,
     get_message_log_tool,
     get_payload_data_tool,
+    get_aif_help_tool,
     build_analysis_report_tool,
 ]
 
