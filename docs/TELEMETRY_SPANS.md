@@ -63,6 +63,11 @@ Set in `app/agent.py stream()` via `invoke_agent_span(...)` + `span.set_attribut
 | `gen_ai.usage.input_tokens` / `output_tokens` / `total_tokens` | from `usage_metadata` of the final LLM message |
 | `user.id` | when XSUAA auth is on |
 | `a2a.context_id` | duplicate of conversation id for convenience |
+| `aif.query` / `gen_ai.prompt` | the user's query text for THIS turn — makes each turn (incl. follow-ups like "How do I fix that error?") distinguishable |
+| `aif.memory.persistent` | true when the SAP Agent Memory client is bound |
+| `aif.memory.history_messages` | number of prior messages loaded into the prompt this turn |
+| `aif.memory.short_term_turns` | in-process short-term turns stored for this context_id |
+| `aif.memory.has_prior_findings` | true when the previous turn's GUID-addressable findings were injected |
 
 ## Dashboard de-noise rule (single source of truth)
 

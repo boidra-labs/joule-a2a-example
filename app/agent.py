@@ -1864,7 +1864,15 @@ class CodemineAgent:
     async def stream(
         self, query: str, context_id: str, a2a_history: list | None = None, parent_context=None, user_id: str = ""
     ) -> AsyncGenerator[dict, None]:
-        span_attrs: dict = {"a2a.context_id": context_id, "gen_ai.request.model": LLM_MODEL}
+        span_attrs: dict = {
+            "a2a.context_id": context_id,
+            "gen_ai.request.model": LLM_MODEL,
+            # Record the actual user query so each turn is distinguishable in
+            # telemetry (otherwise follow-ups like "How do I fix that error?"
+            # are indistinguishable from the first turn).
+            "aif.query": query,
+            "gen_ai.prompt": query,
+        }
         if user_id:
             span_attrs["user.id"] = user_id
 
@@ -1903,6 +1911,14 @@ class CodemineAgent:
                 prior_findings = _context_findings.get(context_id, "")
                 if prior_findings:
                     history = history + [AIMessage(content=prior_findings)]
+
+                # Surface memory state on the span so a follow-up turn is visibly
+                # distinct and you can confirm prior context was loaded.
+                span.set_attribute("aif.memory.persistent", bool(self.memory))
+                span.set_attribute("aif.memory.history_messages", len(history))
+                span.set_attribute("aif.memory.short_term_turns",
+                                   len(_short_term_memory.get(context_id, ())))
+                span.set_attribute("aif.memory.has_prior_findings", bool(prior_findings))
 
                 messages = [SystemMessage(content=SYSTEM_PROMPT)] + history + [HumanMessage(content=query)]
                 result = await self.graph.ainvoke({"messages": messages})
