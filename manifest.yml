@@ -2,7 +2,7 @@
 applications:
   - name: aif-analysis-agent
     docker:
-      image: ghcr.io/codeminepl/aif-analysis-agent:0.13.16
+      image: ghcr.io/codeminepl/aif-analysis-agent:0.13.17
       username: codemine-kwasniewskim
     memory: 512M
     disk_quota: 1G

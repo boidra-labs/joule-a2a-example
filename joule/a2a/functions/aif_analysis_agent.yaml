@@ -16,11 +16,9 @@ action_groups:
       - type: agent-request
         agent_type: remote
         system_alias: AIF_ANALYSIS_AGENT
-        body: >
-          {
-            "contextId": "<? agent_context_id ?>",
-            "taskId": "<? agent_task_id ?>"
-          }
+        body: 
+         contextId: <? agent_context_id ?>
+
         
         result_variable: _agent_response
 
